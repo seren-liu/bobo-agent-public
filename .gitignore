@@ -1,0 +1,15 @@
+.worktrees/
+.env
+.env.local
+*.env.local
+__pycache__/
+*.pyc
+node_modules/
+.expo/
+dist/
+.DS_Store
+backend/.venv/
+data/
+*.har
+*.pcap
+heytea_static_menu.json

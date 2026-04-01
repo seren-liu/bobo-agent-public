@@ -1,0 +1,13 @@
+services:
+  postgres:
+    ports:
+      - "${LOCAL_POSTGRES_PORT:-15432}:5432"
+
+  redis:
+    ports:
+      - "${LOCAL_REDIS_PORT:-16379}:6379"
+
+  qdrant:
+    ports:
+      - "${LOCAL_QDRANT_HTTP_PORT:-16333}:6333"
+      - "${LOCAL_QDRANT_GRPC_PORT:-16334}:6334"
