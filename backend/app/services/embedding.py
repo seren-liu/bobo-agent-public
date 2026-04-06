@@ -7,6 +7,8 @@ import os
 import time
 from typing import Any
 
+from app.services.llm_budget import estimate_tokens, record_usage
+
 logger = logging.getLogger("bobo.embedding")
 
 
@@ -24,6 +26,7 @@ class EmbeddingService:
         dimensions: int | None = None,
         dashscope_base_url: str | None = None,
         openai_base_url: str | None = None,
+        usage_user_id: str | None = None,
     ):
         self._model = model or os.getenv("EMBEDDING_MODEL") or "text-embedding-v4"
         self._dimensions = dimensions or self._resolve_dimensions(self._model)
@@ -42,6 +45,7 @@ class EmbeddingService:
         self._fallback_model = fallback_model_value if fallback_key and fallback_model_value != self._model else ""
         self._fallback_api_key = fallback_key if self._fallback_model else ""
         self._fallback_client = fallback_client
+        self._usage_user_id = usage_user_id
 
     @staticmethod
     def _resolve_dimensions(model: str) -> int | None:
@@ -125,6 +129,15 @@ class EmbeddingService:
                 default=str,
             )
         )
+        if self._usage_user_id:
+            input_tokens = sum(estimate_tokens(text) for text in texts)
+            record_usage(
+                user_id=self._usage_user_id,
+                model=model_used,
+                input_tokens=input_tokens,
+                output_tokens=0,
+                usage_kind="memory_retrieval_embedding" if text_type == "query" else "memory_upsert_embedding",
+            )
         return out
 
     async def _embed_batch_with_model(self, texts: list[str], *, model: str, text_type: str) -> list[list[float]]:

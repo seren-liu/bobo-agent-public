@@ -1,5 +1,7 @@
 from app.tooling.operations import (
     get_calendar_impl,
+    get_day_impl,
+    get_recent_records_impl,
     get_stats_impl,
     record_drink_impl,
     search_menu_impl,
@@ -9,6 +11,8 @@ from app.tooling.registry import get_local_tools, guard_actor, register_mcp_tool
 
 __all__ = [
     "get_calendar_impl",
+    "get_day_impl",
+    "get_recent_records_impl",
     "get_local_tools",
     "get_stats_impl",
     "guard_actor",

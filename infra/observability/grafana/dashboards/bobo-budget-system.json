@@ -1,0 +1,303 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "datasource": {
+        "type": "grafana",
+        "uid": "-- Grafana --"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "options": {
+        "content": "## Low-Cost Agent Budget System\n\n这块面板专门看“低开销额度系统”有没有按预期工作。\n\n重点看三件事：\n1. `Budget Gate Outcomes`：请求是被放行、预算耗尽拦截，还是被本轮预留成本拦截。\n2. `Budget Cost By Usage Kind`：钱到底花在聊天主回复、菜单缺口兜底、记忆抽取，还是 embedding。\n3. `Remaining / Reserved / Output Tokens`：当前预算是否已经逼近边界，用户是不是快被拦了。",
+        "mode": "markdown"
+      },
+      "title": "How To Read",
+      "type": "text"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 6
+      },
+      "id": 2,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (outcome) (rate(bobo_agent_budget_checks_total[5m]))",
+          "legendFormat": "{{outcome}}"
+        }
+      ],
+      "title": "Budget Gate Outcomes",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 6
+      },
+      "id": 3,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(bobo_agent_budget_checks_total{outcome=~\"budget_exhausted|reserve_blocked\"}[24h]))",
+          "legendFormat": "blocked in 24h"
+        }
+      ],
+      "title": "Blocked Requests (24h)",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyCNY"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 6
+      },
+      "id": 4,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(bobo_agent_budget_remaining_cny_bucket[5m])))",
+          "legendFormat": "remaining p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(bobo_agent_budget_remaining_cny_bucket[5m])))",
+          "legendFormat": "remaining p95"
+        }
+      ],
+      "title": "Remaining Budget CNY",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyCNY"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 14
+      },
+      "id": 5,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(bobo_agent_budget_reserved_cost_cny_bucket[5m])))",
+          "legendFormat": "reserved p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(bobo_agent_budget_reserved_cost_cny_bucket[5m])))",
+          "legendFormat": "reserved p95"
+        }
+      ],
+      "title": "Reserved Cost Per Request",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 14
+      },
+      "id": 6,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(bobo_agent_budget_available_output_tokens_bucket[5m])))",
+          "legendFormat": "output tokens p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(bobo_agent_budget_available_output_tokens_bucket[5m])))",
+          "legendFormat": "output tokens p95"
+        }
+      ],
+      "title": "Available Output Tokens After Reserve",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyCNY"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 22
+      },
+      "id": 7,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (usage_kind) (increase(bobo_budget_llm_cost_cny_total[24h]))",
+          "legendFormat": "{{usage_kind}}"
+        }
+      ],
+      "title": "Budget Cost By Usage Kind (24h)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 22
+      },
+      "id": 8,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (usage_kind, direction) (increase(bobo_budget_llm_tokens_total[24h]))",
+          "legendFormat": "{{usage_kind}} / {{direction}}"
+        }
+      ],
+      "title": "Budget Tokens By Usage Kind (24h)",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 41,
+  "style": "dark",
+  "tags": [
+    "bobo",
+    "observability",
+    "budget",
+    "llm-cost"
+  ],
+  "templating": {
+    "list": []
+  },
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "",
+  "title": "Bobo Budget System",
+  "uid": "bobo-budget-system",
+  "version": 1,
+  "weekStart": ""
+}

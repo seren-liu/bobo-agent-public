@@ -1,7 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
-  Alert,
+  Animated,
+  Easing,
+  Keyboard,
+  Modal,
+  Platform,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -14,11 +18,19 @@ import { Ionicons } from '@expo/vector-icons';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { AppButton } from '@/components/AppButton';
-import { boboApi, type AgentMessage, type AgentThread, type MemoryItem, type MemoryProfile, type MenuSearchItem } from '@/lib/api';
+import {
+  boboApi,
+  type AgentMessage,
+  type AgentThread,
+  type MemoryItem,
+  type MemoryProfile,
+  type MenuSearchItem,
+} from '@/lib/api';
 import { getApiBaseUrl } from '@/lib/runtimeConfig';
 import { useAuthStore } from '@/stores/authStore';
 
 type ChatMessage = {
+  id?: string;
   role: 'user' | 'assistant';
   content: string;
   menuResults?: MenuSearchItem[];
@@ -29,7 +41,9 @@ type ChatThread = AgentThread & {
 };
 
 const DEV_LOGIN_ENABLED = process.env.EXPO_PUBLIC_ENABLE_DEV_LOGIN === 'true';
-const FALLBACK_THREAD_TITLE = '本地临时会话';
+const FALLBACK_THREAD_TITLE = '临时对话';
+const MEMORY_PREVIEW_LIMIT = 3;
+const FLOATING_TAB_BAR_SPACE = 96;
 
 function toArray<T>(response: unknown): T[] {
   if (!response) {
@@ -63,7 +77,7 @@ function threadTitle(thread: ChatThread): string {
   if (title) {
     return title;
   }
-  return thread.isLocal ? FALLBACK_THREAD_TITLE : '未命名会话';
+  return formatDateTime(threadUpdatedAt(thread));
 }
 
 function normalizeChatMessage(message: AgentMessage): ChatMessage | null {
@@ -97,35 +111,110 @@ function formatDateTime(value?: string | null): string {
 
 function summarizeProfile(profile: MemoryProfile | null): string[] {
   if (!profile) {
-    return ['尚未加载画像'];
+    return [];
   }
+
   const chips: string[] = [];
   const drink = profile.drink_preferences ?? {};
   const budget = profile.budget_preferences ?? {};
-  const interaction = profile.interaction_preferences ?? {};
 
   const defaultSugar = drink.default_sugar as string | undefined;
   const defaultIce = drink.default_ice as string | undefined;
-  const replyStyle = interaction.reply_style as string | undefined;
   const ceiling = budget.soft_price_ceiling as string | number | undefined;
 
   if (defaultSugar || defaultIce) {
     chips.push([defaultSugar, defaultIce].filter(Boolean).join(' / '));
   }
   if (Array.isArray(drink.preferred_brands) && drink.preferred_brands.length > 0) {
-    chips.push(`偏好品牌: ${(drink.preferred_brands as string[]).slice(0, 2).join('、')}`);
+    chips.push(`偏好品牌 ${drink.preferred_brands.slice(0, 2).join('、')}`);
   }
   if (Array.isArray(drink.preferred_categories) && drink.preferred_categories.length > 0) {
-    chips.push(`偏好品类: ${(drink.preferred_categories as string[]).slice(0, 2).join('、')}`);
+    chips.push(`常点 ${drink.preferred_categories.slice(0, 2).join('、')}`);
   }
   if (typeof ceiling === 'number' || typeof ceiling === 'string') {
-    chips.push(`预算上限: ¥${ceiling}`);
-  }
-  if (replyStyle) {
-    chips.push(`回复风格: ${replyStyle}`);
+    chips.push(`预算 ¥${ceiling} 内`);
   }
 
-  return chips.length ? chips : ['画像已加载，但还没有可展示的偏好'];
+  return chips;
+}
+
+function isPendingAssistantMessage(message: ChatMessage): boolean {
+  return message.role === 'assistant' && !message.content.trim() && !(message.menuResults?.length);
+}
+
+function pickStringArray(value: unknown, limit = 3): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.map((item) => String(item).trim()).filter(Boolean).slice(0, limit);
+}
+
+function parseApiErrorMessage(raw: string, fallbackStatus?: number): string {
+  const text = raw.trim();
+  if (!text) {
+    return fallbackStatus ? `HTTP ${fallbackStatus}` : 'unknown error';
+  }
+  try {
+    const payload = JSON.parse(text) as { detail?: unknown; message?: unknown; error?: unknown };
+    const detail = payload.detail ?? payload.message ?? payload.error;
+    if (typeof detail === 'string' && detail.trim()) {
+      return detail.trim();
+    }
+  } catch {
+    // Fall through to raw text.
+  }
+  return text;
+}
+
+function summarizePortrait(profile: MemoryProfile | null): Array<{ label: string; value: string }> {
+  if (!profile) {
+    return [];
+  }
+
+  const drink = profile.drink_preferences ?? {};
+  const interaction = profile.interaction_preferences ?? {};
+  const budget = profile.budget_preferences ?? {};
+  const health = profile.health_preferences ?? {};
+
+  const portrait: Array<{ label: string; value: string }> = [];
+
+  const sugar = typeof drink.default_sugar === 'string' ? drink.default_sugar : '';
+  const ice = typeof drink.default_ice === 'string' ? drink.default_ice : '';
+  if (sugar || ice) {
+    portrait.push({ label: '默认口味', value: [sugar, ice].filter(Boolean).join(' / ') });
+  }
+
+  const brands = pickStringArray(drink.preferred_brands, 3);
+  if (brands.length) {
+    portrait.push({ label: '偏好品牌', value: brands.join('、') });
+  }
+
+  const categories = pickStringArray(drink.preferred_categories, 3);
+  if (categories.length) {
+    portrait.push({ label: '常喝类型', value: categories.join('、') });
+  }
+
+  const softCeiling = budget.soft_price_ceiling;
+  if (typeof softCeiling === 'number' || typeof softCeiling === 'string') {
+    portrait.push({ label: '预算区间', value: `通常控制在 ¥${softCeiling} 内` });
+  }
+
+  const disliked = pickStringArray(drink.disliked_flavors, 3);
+  if (disliked.length) {
+    portrait.push({ label: '避雷口味', value: disliked.join('、') });
+  }
+
+  const style = pickStringArray(interaction.response_style, 2);
+  if (style.length) {
+    portrait.push({ label: '回答风格', value: style.join('、') });
+  }
+
+  const healthGoals = pickStringArray(health.goals, 2);
+  if (healthGoals.length) {
+    portrait.push({ label: '关注点', value: healthGoals.join('、') });
+  }
+
+  return portrait;
 }
 
 function createLocalThread(title = FALLBACK_THREAD_TITLE): ChatThread {
@@ -147,6 +236,7 @@ export default function AiScreen() {
   const logout = useAuthStore((s) => s.logout);
   const setSession = useAuthStore((s) => s.setSession);
   const userId = useAuthStore((s) => s.userId) ?? 'dev';
+
   const [loginPending, setLoginPending] = useState(false);
   const [loginError, setLoginError] = useState<string | null>(null);
   const [input, setInput] = useState('');
@@ -154,13 +244,16 @@ export default function AiScreen() {
   const [initializing, setInitializing] = useState(false);
   const [threadLoadError, setThreadLoadError] = useState<string | null>(null);
   const [memoryLoadError, setMemoryLoadError] = useState<string | null>(null);
-  const [showMemoryPanel, setShowMemoryPanel] = useState(false);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
   const [threads, setThreads] = useState<ChatThread[]>([]);
   const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
   const [threadMessages, setThreadMessages] = useState<Record<string, ChatMessage[]>>({});
   const [memoryProfile, setMemoryProfile] = useState<MemoryProfile | null>(null);
   const [memoryItems, setMemoryItems] = useState<MemoryItem[]>([]);
+  const [keyboardHeight, setKeyboardHeight] = useState(0);
   const loadedThreadIdsRef = useRef(new Set<string>());
+  const pageScrollRef = useRef<ScrollView | null>(null);
+  const shimmerProgress = useRef(new Animated.Value(0)).current;
 
   const baseUrl = useMemo(() => getApiBaseUrl(), []);
 
@@ -175,6 +268,19 @@ export default function AiScreen() {
     }
     return threadMessages[activeThreadId] ?? [];
   }, [activeThreadId, threadMessages]);
+
+  const profileHighlights = useMemo(() => summarizeProfile(memoryProfile), [memoryProfile]);
+  const portraitRows = useMemo(() => summarizePortrait(memoryProfile), [memoryProfile]);
+  const memoryHighlights = useMemo(
+    () => memoryItems.map((memory) => memory.content).filter(Boolean).slice(0, MEMORY_PREVIEW_LIMIT),
+    [memoryItems]
+  );
+
+  const composerBottomOffset = keyboardHeight > 0 ? Math.max(12, keyboardHeight - insets.bottom + 8) : FLOATING_TAB_BAR_SPACE;
+  const shimmerTranslate = shimmerProgress.interpolate({
+    inputRange: [0, 1],
+    outputRange: [-220, 220],
+  });
 
   const loadMemoryState = async () => {
     try {
@@ -214,11 +320,7 @@ export default function AiScreen() {
         .map(normalizeChatMessage)
         .filter((item): item is ChatMessage => Boolean(item));
 
-      if (items.length > 0) {
-        setThreadMessages((prev) => ({ ...prev, [threadId]: items }));
-      } else if (!threadMessages[threadId]) {
-        setThreadMessages((prev) => ({ ...prev, [threadId]: [] }));
-      }
+      setThreadMessages((prev) => ({ ...prev, [threadId]: items }));
       loadedThreadIdsRef.current.add(threadId);
     } catch {
       if (!threadMessages[threadId]) {
@@ -246,24 +348,17 @@ export default function AiScreen() {
         const nextThread = remoteThreads[0];
         const nextThreadId = threadIdentity(nextThread);
         setActiveThreadId(nextThreadId);
-        if (!threadMessages[nextThreadId]) {
-          setThreadMessages((prev) => ({ ...prev, [nextThreadId]: prev[nextThreadId] ?? [] }));
-        }
+        setThreadMessages((prev) => ({ ...prev, [nextThreadId]: prev[nextThreadId] ?? [] }));
         await loadThreadMessages(nextThread);
       } else {
-        const localThread = createLocalThread();
-        const localThreadId = threadIdentity(localThread);
-        setThreads([localThread]);
-        setActiveThreadId(localThreadId);
-        setThreadMessages((prev) => ({ ...prev, [localThreadId]: [] }));
+        setThreads([]);
+        setActiveThreadId(null);
       }
+
     } catch (error) {
       setThreadLoadError(error instanceof Error ? error.message : 'thread load failed');
-      const localThread = createLocalThread();
-      const localThreadId = threadIdentity(localThread);
-      setThreads([localThread]);
-      setActiveThreadId(localThreadId);
-      setThreadMessages((prev) => ({ ...prev, [localThreadId]: [] }));
+      setThreads([]);
+      setActiveThreadId(null);
     } finally {
       setInitializing(false);
     }
@@ -280,6 +375,67 @@ export default function AiScreen() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [accessToken]);
 
+  useEffect(() => {
+    const showEvent = Platform.OS === 'ios' ? 'keyboardWillShow' : 'keyboardDidShow';
+    const hideEvent = Platform.OS === 'ios' ? 'keyboardWillHide' : 'keyboardDidHide';
+
+    const showSub = Keyboard.addListener(showEvent, (event) => {
+      setKeyboardHeight(event.endCoordinates.height);
+    });
+    const hideSub = Keyboard.addListener(hideEvent, () => {
+      setKeyboardHeight(0);
+    });
+
+    return () => {
+      showSub.remove();
+      hideSub.remove();
+    };
+  }, []);
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      pageScrollRef.current?.scrollToEnd({ animated: true });
+    }, 80);
+    return () => clearTimeout(timer);
+  }, [keyboardHeight, activeMessages.length, sending]);
+
+  useEffect(() => {
+    if (!sending) {
+      shimmerProgress.stopAnimation();
+      shimmerProgress.setValue(0);
+      return;
+    }
+
+    const loop = Animated.loop(
+      Animated.timing(shimmerProgress, {
+        toValue: 1,
+        duration: 1450,
+        easing: Easing.inOut(Easing.ease),
+        useNativeDriver: true,
+      })
+    );
+
+    loop.start();
+    return () => {
+      loop.stop();
+      shimmerProgress.stopAnimation();
+      shimmerProgress.setValue(0);
+    };
+  }, [sending, shimmerProgress]);
+
+  const upsertStreamingAssistant = (threadId: string, messageId: string, updater: (current: ChatMessage) => ChatMessage) => {
+    setThreadMessages((prev) => {
+      const current = prev[threadId] ?? [];
+      const index = current.findIndex((message) => message.id === messageId);
+      if (index === -1) {
+        return prev;
+      }
+      const next = [...current];
+      next[index] = updater(next[index] ?? { id: messageId, role: 'assistant', content: '' });
+      return { ...prev, [threadId]: next };
+    });
+  };
+
   const loginAsDev = async () => {
     try {
       setLoginPending(true);
@@ -294,19 +450,6 @@ export default function AiScreen() {
       setLoginError('Dev login failed. Please ensure backend has user dev/dev123456.');
     } finally {
       setLoginPending(false);
-    }
-  };
-
-  const refreshEverything = async () => {
-    if (!accessToken) {
-      return;
-    }
-
-    try {
-      setInitializing(true);
-      await bootstrapThreads();
-    } finally {
-      setInitializing(false);
     }
   };
 
@@ -327,7 +470,7 @@ export default function AiScreen() {
     }
   };
 
-  const ensureThread = async (): Promise<ChatThread> => {
+  const ensureThread = async (): Promise<ChatThread | null> => {
     if (activeThread) {
       return activeThread;
     }
@@ -335,13 +478,13 @@ export default function AiScreen() {
     try {
       const { data } = await boboApi.createAgentThread('新会话');
       const thread = { ...data, isLocal: false } as ChatThread;
-      setThreads((prev) => [thread, ...prev]);
       const threadId = threadIdentity(thread);
+      setThreads((prev) => [thread, ...prev]);
       setActiveThreadId(threadId);
       setThreadMessages((prev) => ({ ...prev, [threadId]: prev[threadId] ?? [] }));
       return thread;
     } catch {
-      const localThread = createLocalThread();
+      const localThread = createLocalThread('新会话');
       const threadId = threadIdentity(localThread);
       setThreads((prev) => [localThread, ...prev]);
       setActiveThreadId(threadId);
@@ -353,9 +496,7 @@ export default function AiScreen() {
   const handleSelectThread = async (thread: ChatThread) => {
     const threadId = threadIdentity(thread);
     setActiveThreadId(threadId);
-    if (!threadMessages[threadId]) {
-      setThreadMessages((prev) => ({ ...prev, [threadId]: [] }));
-    }
+    setThreadMessages((prev) => ({ ...prev, [threadId]: prev[threadId] ?? [] }));
     await loadThreadMessages(thread);
   };
 
@@ -363,6 +504,7 @@ export default function AiScreen() {
     if (!accessToken) {
       return;
     }
+
     try {
       const { data } = await boboApi.createAgentThread('新会话');
       const thread = { ...data, isLocal: false } as ChatThread;
@@ -372,63 +514,12 @@ export default function AiScreen() {
       setThreadMessages((prev) => ({ ...prev, [threadId]: [] }));
       loadedThreadIdsRef.current.delete(threadId);
     } catch {
-      const localThread = createLocalThread();
+      const localThread = createLocalThread('新会话');
       const threadId = threadIdentity(localThread);
       setThreads((prev) => [localThread, ...prev]);
       setActiveThreadId(threadId);
       setThreadMessages((prev) => ({ ...prev, [threadId]: [] }));
     }
-  };
-
-  const persistMemoryProfile = async (patch: Partial<MemoryProfile>) => {
-    try {
-      const { data } = await boboApi.patchAgentProfile(patch);
-      setMemoryProfile(data);
-      await loadMemoryState();
-    } catch (error) {
-      setMemoryLoadError(error instanceof Error ? error.message : 'profile update failed');
-    }
-  };
-
-  const handleResetProfile = () => {
-    Alert.alert('重置画像', '确定要清空当前画像吗？这会重置默认偏好。', [
-      { text: '取消', style: 'cancel' },
-      {
-        text: '重置',
-        style: 'destructive',
-        onPress: async () => {
-          try {
-            const { data } = await boboApi.resetAgentProfile();
-            setMemoryProfile(data);
-            await loadMemoryState();
-          } catch (error) {
-            setMemoryLoadError(error instanceof Error ? error.message : 'profile reset failed');
-          }
-        },
-      },
-    ]);
-  };
-
-  const handleMemoryAction = (memory: MemoryItem, action: 'delete' | 'disable') => {
-    Alert.alert(action === 'delete' ? '删除记忆' : '停用记忆', `确定要${action === 'delete' ? '删除' : '停用'}这条记忆吗？`, [
-      { text: '取消', style: 'cancel' },
-      {
-        text: action === 'delete' ? '删除' : '停用',
-        style: 'destructive',
-        onPress: async () => {
-          try {
-            if (action === 'delete') {
-              await boboApi.deleteAgentMemory(memory.id);
-            } else {
-              await boboApi.disableAgentMemory(memory.id);
-            }
-            await loadMemoryState();
-          } catch (error) {
-            setMemoryLoadError(error instanceof Error ? error.message : 'memory action failed');
-          }
-        },
-      },
-    ]);
   };
 
   const send = async () => {
@@ -442,14 +533,25 @@ export default function AiScreen() {
 
     try {
       const thread = await ensureThread();
+      if (!thread) {
+        setSending(false);
+        return;
+      }
+
       const threadId = threadIdentity(thread);
+      const assistantMessageId = `assistant-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       setThreadMessages((prev) => {
         const current = prev[threadId] ?? [];
         return {
           ...prev,
-          [threadId]: [...current, { role: 'user', content: text }],
+          [threadId]: [
+            ...current,
+            { role: 'user', content: text },
+            { id: assistantMessageId, role: 'assistant', content: '' },
+          ],
         };
       });
+
       const makeRequest = (bearerToken: string) =>
         fetch(`${baseUrl}/bobo/agent/chat`, {
           method: 'POST',
@@ -483,55 +585,91 @@ export default function AiScreen() {
 
       if (!res.ok) {
         const body = await res.text();
-        throw new Error(body || `HTTP ${res.status}`);
+        throw new Error(parseApiErrorMessage(body, res.status));
       }
 
-      const raw = await res.text();
+      const reader = res.body?.getReader();
+      const decoder = new TextDecoder('utf-8');
+      let buffer = '';
       let assistant = '';
       let menuResults: MenuSearchItem[] = [];
-
-      for (const line of raw.split('\n')) {
+      const handlePayloadLine = (line: string) => {
         if (!line.startsWith('data: ')) {
-          continue;
+          return;
         }
         const payloadText = line.slice(6).trim();
         if (!payloadText) {
-          continue;
+          return;
         }
         try {
           const payload = JSON.parse(payloadText);
           if (payload.type === 'text') {
             assistant += String(payload.content ?? '');
+            upsertStreamingAssistant(threadId, assistantMessageId, (current) => ({
+              ...current,
+              content: assistant,
+            }));
           }
           if (payload.type === 'error') {
             assistant += `\n[error] ${String(payload.error ?? '')}`;
+            upsertStreamingAssistant(threadId, assistantMessageId, (current) => ({
+              ...current,
+              content: assistant,
+            }));
           }
           if (payload.type === 'tool_result' && payload.tool === 'search_menu') {
             const output = payload.output;
             const parsed = typeof output === 'string' ? JSON.parse(output) : output;
             if (parsed?.results && Array.isArray(parsed.results)) {
               menuResults = parsed.results;
+              upsertStreamingAssistant(threadId, assistantMessageId, (current) => ({
+                ...current,
+                menuResults,
+              }));
             }
           }
         } catch {
           // Ignore malformed event lines from SSE fallback payloads.
         }
+      };
+
+      if (reader) {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) {
+            buffer += decoder.decode();
+            break;
+          }
+          buffer += decoder.decode(value, { stream: true });
+          const parts = buffer.split('\n');
+          buffer = parts.pop() ?? '';
+          for (const line of parts) {
+            handlePayloadLine(line);
+          }
+        }
+      } else {
+        const raw = await res.text();
+        for (const line of raw.split('\n')) {
+          handlePayloadLine(line);
+        }
       }
 
-      setThreadMessages((prev) => {
-        const current = prev[threadId] ?? [];
-        const nextMessage: ChatMessage = {
-          role: 'assistant',
-          content: assistant.trim() || '(No response)',
-          menuResults,
-        };
-        const next = [...current, nextMessage];
-        return { ...prev, [threadId]: next };
-      });
+      if (buffer.trim()) {
+        for (const line of buffer.split('\n')) {
+          handlePayloadLine(line);
+        }
+      }
+
+      upsertStreamingAssistant(threadId, assistantMessageId, (current) => ({
+        ...current,
+        content: assistant.trim() || '(No response)',
+        menuResults,
+      }));
 
       await Promise.all([refreshActiveThread(threadId), loadMemoryState()]);
     } catch (err) {
-      const threadId = activeThreadId ?? threadIdentity(await ensureThread());
+      const ensuredThread = activeThread ?? (await ensureThread());
+      const threadId = ensuredThread ? threadIdentity(ensuredThread) : 'fallback';
       setThreadMessages((prev) => {
         const current = prev[threadId] ?? [];
         return {
@@ -571,320 +709,327 @@ export default function AiScreen() {
     );
   }
 
-  const profileChips = summarizeProfile(memoryProfile);
-  const activeThreadMessageCount =
-    activeThread && activeThreadId
-      ? activeThread.message_count ?? threadMessages[activeThreadId]?.length ?? 0
-      : 0;
-
   return (
     <View style={styles.container}>
-      <View style={styles.backgroundOrbOne} />
-      <View style={styles.backgroundOrbTwo} />
+      <View style={styles.backgroundGlowTop} />
+      <View style={styles.backgroundGlowBottom} />
+
       <ScrollView
+        ref={pageScrollRef}
         style={styles.pageScroll}
-        contentContainerStyle={[styles.pageContent, { paddingTop: insets.top + 10, paddingBottom: insets.bottom + 124 }]}
+        contentContainerStyle={[styles.pageContent, { paddingTop: insets.top + 10, paddingBottom: composerBottomOffset + 120 }]}
         showsVerticalScrollIndicator={false}
         keyboardShouldPersistTaps="handled"
       >
         <LinearGradient
-          colors={['#FFD7E2', '#FFC2CF', '#FFF3B0']}
+          colors={['#FFF1E7', '#FDDDE7', '#FFF6CF']}
           start={{ x: 0, y: 0 }}
           end={{ x: 1, y: 1 }}
-          style={styles.heroCard}
+          style={styles.minimalHero}
         >
-          <View style={styles.heroTopRow}>
-            <View style={styles.heroTextBlock}>
+          <View style={styles.minimalTopbar}>
+            <View style={styles.minimalBrandBlock}>
               <Text style={styles.eyebrow}>Bobo Intelligence</Text>
               <Text style={styles.title}>AI Chat</Text>
-              <Text style={styles.subtitle}>
-                {activeThread ? `${threadTitle(activeThread)} · ${formatDateTime(threadUpdatedAt(activeThread))}` : '正在准备会话'}
-              </Text>
             </View>
-            <View style={styles.heroIconBadge}>
-              <Ionicons name="sparkles" size={18} color="#172033" />
-            </View>
-          </View>
-
-          <View style={styles.metricRow}>
-            <View style={styles.metricCard}>
-              <Text style={styles.metricLabel}>当前会话</Text>
-              <Text style={styles.metricValue}>{activeThreadMessageCount}</Text>
-              <Text style={styles.metricMeta}>messages</Text>
-            </View>
-            <View style={styles.metricCard}>
-              <Text style={styles.metricLabel}>长期记忆</Text>
-              <Text style={styles.metricValue}>{memoryItems.length}</Text>
-              <Text style={styles.metricMeta}>entries</Text>
-            </View>
-            <View style={styles.metricCard}>
-              <Text style={styles.metricLabel}>状态</Text>
-              <Text style={styles.metricValueSmall}>{sending ? 'Thinking' : 'Ready'}</Text>
-              <Text style={styles.metricMeta}>assistant</Text>
-            </View>
-          </View>
-
-          <View style={styles.headerActions}>
-            <Pressable style={styles.headerChipStrong} onPress={handleNewThread}>
-              <Ionicons name="add" size={14} color="#172033" />
-              <Text style={styles.headerChipStrongText}>新会话</Text>
-            </Pressable>
-            <Pressable style={styles.headerChipSoft} onPress={refreshEverything}>
-              <Text style={styles.headerChipSoftText}>{initializing ? '刷新中' : '刷新'}</Text>
-            </Pressable>
-            <Pressable style={styles.headerChipSoft} onPress={() => setShowMemoryPanel((prev) => !prev)}>
-              <Text style={styles.headerChipSoftText}>{showMemoryPanel ? '收起记忆' : '展开记忆'}</Text>
+            <Pressable style={styles.sidebarTrigger} onPress={() => setSidebarOpen(true)}>
+              <Ionicons name="menu" size={18} color="#14213D" />
             </Pressable>
           </View>
         </LinearGradient>
 
-        <View style={styles.sectionBlock}>
-          <View style={styles.sectionHeader}>
-            <Text style={styles.sectionTitle}>会话列表</Text>
-            <Text style={styles.sectionCaption}>向右滑动切换最近线程</Text>
-          </View>
-          <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.threadStrip}>
-            {threads.map((thread) => {
-              const threadId = threadIdentity(thread);
-              const selected = threadId === activeThreadId;
-              return (
-                <Pressable
-                  key={threadId}
-                  onPress={() => {
-                    void handleSelectThread(thread);
-                  }}
-                  style={[styles.threadCard, selected && styles.threadCardActive]}
-                >
-                  {selected ? (
-                    <LinearGradient
-                      colors={['#172033', '#2A3350']}
-                      start={{ x: 0, y: 0 }}
-                      end={{ x: 1, y: 1 }}
-                      style={styles.threadCardGradient}
-                    >
-                      <Text style={[styles.threadCardTitle, styles.threadCardTitleActive]} numberOfLines={1}>
-                        {threadTitle(thread)}
-                      </Text>
-                      <Text style={[styles.threadCardMeta, styles.threadCardMetaActive]}>
-                        {thread.message_count ?? threadMessages[threadId]?.length ?? 0} 条消息
-                      </Text>
-                      <Text style={styles.threadCardTimestamp}>{formatDateTime(threadUpdatedAt(thread))}</Text>
-                    </LinearGradient>
-                  ) : (
-                    <>
-                      <Text style={styles.threadCardTitle} numberOfLines={1}>
-                        {threadTitle(thread)}
-                      </Text>
-                      <Text style={styles.threadCardMeta}>
-                        {thread.message_count ?? threadMessages[threadId]?.length ?? 0} 条消息
-                      </Text>
-                      <Text style={styles.threadCardTimestamp}>{formatDateTime(threadUpdatedAt(thread))}</Text>
-                    </>
-                  )}
-                </Pressable>
-              );
-            })}
-          </ScrollView>
-        </View>
-
-        <View style={[styles.memoryPanel, showMemoryPanel && styles.memoryPanelExpanded]}>
-          <View style={styles.sectionHeader}>
-            <View>
-              <Text style={styles.sectionTitle}>记忆画像</Text>
-              <Text style={styles.sectionCaption}>让回答更像你的偏好，而不是通用模板</Text>
-            </View>
-            <View style={styles.sectionActions}>
-              <Pressable style={styles.inlineChip} onPress={() => void loadMemoryState()}>
-                <Text style={styles.inlineChipText}>刷新</Text>
-              </Pressable>
-              {showMemoryPanel ? (
-                <Pressable style={styles.inlineChip} onPress={handleResetProfile}>
-                  <Text style={styles.inlineChipText}>重置画像</Text>
-                </Pressable>
-              ) : null}
+        {!activeMessages.length ? (
+          <View style={styles.emptyStage}>
+            <View style={styles.welcomeCard}>
+              <Text style={styles.welcomeEyebrow}>Start Here</Text>
+              <Text style={styles.welcomeTitle}>今天想喝什么？</Text>
+              <View style={styles.promptGrid}>
+                {['预算 20 元，今天喝什么', '记住我默认少糖少冰', '最近别推荐太甜的', '想喝果茶，但不要太贵'].map((prompt) => (
+                  <Pressable key={prompt} style={styles.promptCard} onPress={() => setInput(prompt)}>
+                    <Text style={styles.promptCardText}>{prompt}</Text>
+                  </Pressable>
+                ))}
+              </View>
             </View>
           </View>
+        ) : null}
 
-          <View style={styles.profileChipWrap}>
-            {profileChips.slice(0, showMemoryPanel ? profileChips.length : 3).map((chip) => (
-              <View key={chip} style={styles.profileChip}>
-                <Text style={styles.profileChipText}>{chip}</Text>
-              </View>
-            ))}
+        {(threadLoadError || memoryLoadError) && (
+          <View style={styles.syncNote}>
+            <Ionicons name="alert-circle-outline" size={14} color="#9A5B13" />
+            <Text style={styles.syncNoteText}>{threadLoadError || memoryLoadError}</Text>
           </View>
+        )}
 
-          {showMemoryPanel ? (
-            <>
-              <View style={styles.quickActions}>
-                <Pressable
-                  style={styles.inlineChipAccent}
-                  onPress={() =>
-                    void persistMemoryProfile({
-                      drink_preferences: {
-                        ...(memoryProfile?.drink_preferences ?? {}),
-                        default_sugar: '少糖',
-                        default_ice: '少冰',
-                      },
-                    })
-                  }
-                >
-                  <Text style={styles.inlineChipAccentText}>默认少糖少冰</Text>
-                </Pressable>
-                <Pressable
-                  style={styles.inlineChipAccent}
-                  onPress={() =>
-                    void persistMemoryProfile({
-                      interaction_preferences: {
-                        ...(memoryProfile?.interaction_preferences ?? {}),
-                        reply_style: 'brief',
-                      },
-                    })
-                  }
-                >
-                  <Text style={styles.inlineChipAccentText}>回复简洁</Text>
-                </Pressable>
-              </View>
-
-              <View style={styles.memoryList}>
-                {memoryItems.length ? (
-                  memoryItems.slice(0, 6).map((memory) => (
-                    <View key={memory.id} style={styles.memoryCard}>
-                      <View style={styles.memoryCardTop}>
-                        <Text style={styles.memoryContent} numberOfLines={3}>
-                          {memory.content}
-                        </Text>
-                        <Text style={styles.memoryBadge}>{memory.memory_type}</Text>
-                      </View>
-                      <Text style={styles.memoryMeta}>
-                        {memory.scope} · {memory.source_kind} · 置信度 {(memory.confidence ?? 0.5).toFixed(2)}
-                      </Text>
-                      <View style={styles.memoryActions}>
-                        <Pressable style={styles.inlineChip} onPress={() => handleMemoryAction(memory, 'disable')}>
-                          <Text style={styles.inlineChipText}>停用</Text>
-                        </Pressable>
-                        <Pressable style={[styles.inlineChip, styles.inlineDangerChip]} onPress={() => handleMemoryAction(memory, 'delete')}>
-                          <Text style={[styles.inlineChipText, styles.inlineDangerChipText]}>删除</Text>
-                        </Pressable>
-                      </View>
-                    </View>
-                  ))
-                ) : (
-                  <Text style={styles.tip}>{memoryLoadError ? `记忆加载失败：${memoryLoadError}` : '当前没有长期记忆。'}</Text>
-                )}
-              </View>
-            </>
-          ) : null}
-        </View>
-
-        {threadLoadError ? <Text style={styles.warnText}>会话列表降级使用本地模式：{threadLoadError}</Text> : null}
-        {memoryLoadError ? <Text style={styles.warnText}>记忆面板当前为降级状态：{memoryLoadError}</Text> : null}
-
-        <View style={styles.chatPanel}>
-          <View style={styles.chatPanelHeader}>
+        <View style={[styles.chatPanel, !activeMessages.length && styles.chatPanelCompact]}>
+          <View style={styles.chatHeader}>
             <View>
-              <Text style={styles.chatPanelTitle}>对话流</Text>
-              <Text style={styles.chatPanelCaption}>
-                {activeMessages.length ? `已载入 ${activeMessages.length} 条消息` : '还没有内容，先问点什么吧'}
+              <Text style={styles.chatTitle}>{activeThread ? formatDateTime(threadUpdatedAt(activeThread)) : '新对话'}</Text>
+              <Text style={styles.chatCaption}>
+                {activeMessages.length ? '继续当前对话，额度会按实际模型消耗累计。' : '开始后会按每日 AI 额度累计消耗。'}
               </Text>
             </View>
-            <View style={styles.chatStatusPill}>
-              <View style={[styles.chatStatusDot, sending && styles.chatStatusDotBusy]} />
-              <Text style={styles.chatStatusText}>{sending ? '思考中' : '在线'}</Text>
+            <View style={styles.statusPill}>
+              <View style={[styles.statusDot, sending && styles.statusDotBusy]} />
+              <Text style={styles.statusText}>{sending ? '思考中' : '在线'}</Text>
             </View>
           </View>
 
           <View style={styles.chatArea}>
-          {initializing && !activeMessages.length ? (
-            <View style={styles.emptyState}>
-              <ActivityIndicator color="#172033" size="small" />
-              <Text style={styles.tip}>正在恢复最近会话...</Text>
-            </View>
-          ) : null}
-
-          {!initializing && !activeMessages.length ? (
-            <View style={styles.welcomeCard}>
-              <Text style={styles.welcomeEyebrow}>Starter Prompts</Text>
-              <Text style={styles.welcomeTitle}>让 Bobo 按你的口味推荐</Text>
-              <Text style={styles.welcomeText}>试试问它今天该喝什么、预算内推荐，或者让它记住你的甜度与冰量偏好。</Text>
-            </View>
-          ) : null}
-
-          {activeMessages.map((message, idx) => (
-            <View
-              key={`${activeThreadId ?? 'thread'}-${idx}-${message.role}`}
-              style={[styles.messageRow, message.role === 'user' ? styles.messageRowUser : styles.messageRowAi]}
-            >
-              <View style={styles.avatarDotWrap}>
-                <View style={[styles.avatarDot, message.role === 'user' ? styles.avatarDotUser : styles.avatarDotAi]}>
-                  <Ionicons
-                    name={message.role === 'user' ? 'person' : 'sparkles'}
-                    size={12}
-                    color={message.role === 'user' ? '#172033' : '#FFFFFF'}
-                  />
-                </View>
+            {initializing && !activeMessages.length ? (
+              <View style={styles.emptyState}>
+                <ActivityIndicator color="#14213D" size="small" />
+                <Text style={styles.tip}>正在恢复最近会话...</Text>
               </View>
-              <View style={[styles.bubble, message.role === 'user' ? styles.userBubble : styles.aiBubble]}>
-                <Text style={message.role === 'user' ? styles.userText : styles.aiText}>{message.content}</Text>
-                {message.role === 'assistant' && message.menuResults?.length ? (
-                  <View style={styles.menuResults}>
-                    {message.menuResults.map((item) => (
-                      <View key={item.id} style={styles.menuCard}>
-                        <View style={styles.menuCardTop}>
-                          <Text style={styles.menuName}>
-                            {item.brand} {item.name}
-                          </Text>
-                          {typeof item.price === 'number' ? (
-                            <Text style={styles.menuPrice}>¥{Number(item.price).toFixed(0)}</Text>
-                          ) : null}
-                        </View>
-                        <Text style={styles.menuMeta}>{item.size || '常规杯'}</Text>
-                        {item.description ? <Text style={styles.menuDescription}>{item.description}</Text> : null}
-                      </View>
-                    ))}
+            ) : null}
+
+            {activeMessages.map((message, idx) => (
+              <View
+                key={message.id ?? `${activeThreadId ?? 'thread'}-${idx}-${message.role}`}
+                style={[styles.messageRow, message.role === 'user' ? styles.messageRowUser : styles.messageRowAssistant]}
+              >
+                {message.role === 'assistant' ? (
+                  <View style={styles.avatar}>
+                    <Ionicons name="sparkles" size={12} color="#FFFFFF" />
                   </View>
                 ) : null}
-              </View>
-            </View>
-          ))}
 
-          {sending ? (
-            <View style={[styles.messageRow, styles.messageRowAi]}>
-              <View style={styles.avatarDotWrap}>
-                <View style={[styles.avatarDot, styles.avatarDotAi]}>
-                  <Ionicons name="sparkles" size={12} color="#FFFFFF" />
-                </View>
+                {isPendingAssistantMessage(message) ? (
+                  <View style={styles.thinkingCard}>
+                    <View style={styles.thinkingHeader}>
+                      <View style={styles.thinkingPulse}>
+                        <Ionicons name="sparkles" size={12} color="#14213D" />
+                      </View>
+                      <View style={styles.thinkingCopy}>
+                        <Text style={styles.thinkingTitle}>Bobo 正在思考</Text>
+                        <Text style={styles.thinkingSubtitle}>整理偏好、预算和最近上下文</Text>
+                      </View>
+                    </View>
+                    <View style={styles.thinkingSkeleton}>
+                      {[0, 1, 2].map((index) => (
+                        <View
+                          key={index}
+                          style={[
+                            styles.shimmerBar,
+                            index === 0 && styles.shimmerBarWide,
+                            index === 1 && styles.shimmerBarMedium,
+                            index === 2 && styles.shimmerBarShort,
+                          ]}
+                        >
+                          <Animated.View
+                            pointerEvents="none"
+                            style={[
+                              styles.shimmerSweep,
+                              {
+                                transform: [{ translateX: shimmerTranslate }],
+                              },
+                            ]}
+                          >
+                            <LinearGradient
+                              colors={['rgba(255,255,255,0)', 'rgba(255,255,255,0.82)', 'rgba(255,255,255,0)']}
+                              start={{ x: 0, y: 0.5 }}
+                              end={{ x: 1, y: 0.5 }}
+                              style={styles.shimmerGradient}
+                            />
+                          </Animated.View>
+                        </View>
+                      ))}
+                    </View>
+                  </View>
+                ) : (
+                  <View style={[styles.bubble, message.role === 'user' ? styles.userBubble : styles.assistantBubble]}>
+                    <Text style={message.role === 'user' ? styles.userText : styles.assistantText}>{message.content}</Text>
+
+                    {message.role === 'assistant' && message.menuResults?.length ? (
+                      <View style={styles.menuResults}>
+                        {message.menuResults.map((item) => (
+                          <View key={item.id} style={styles.menuCard}>
+                            <View style={styles.menuCardTop}>
+                              <Text style={styles.menuName}>
+                                {item.brand} {item.name}
+                              </Text>
+                              {typeof item.price === 'number' ? <Text style={styles.menuPrice}>¥{Number(item.price).toFixed(0)}</Text> : null}
+                            </View>
+                            <Text style={styles.menuMeta}>{item.size || '常规杯'}</Text>
+                            {item.description ? <Text style={styles.menuDescription}>{item.description}</Text> : null}
+                          </View>
+                        ))}
+                      </View>
+                    ) : null}
+                  </View>
+                )}
               </View>
-              <View style={[styles.bubble, styles.aiBubble, styles.thinkingBubble]}>
-                <ActivityIndicator color="#172033" size="small" />
-                <Text style={styles.aiText}>Bobo 正在整理回答…</Text>
-              </View>
-            </View>
-          ) : null}
+            ))}
           </View>
         </View>
+      </ScrollView>
 
-        <View style={styles.inputBar}>
+      <View style={[styles.composerWrap, { bottom: composerBottomOffset, paddingBottom: insets.bottom + 10 }]}>
+        <View style={styles.composerCard}>
           <View style={styles.inputShell}>
             <TextInput
               value={input}
               onChangeText={setInput}
               placeholder="问问 Bobo 今天喝什么..."
-              placeholderTextColor="#9CA3AF"
+              placeholderTextColor="#8B909C"
               style={styles.input}
               editable={!sending}
               onSubmitEditing={send}
             />
-            <Text style={styles.inputHint}>支持偏好、预算、品牌、记忆相关提问</Text>
+            <Text style={styles.inputHint}>
+              对话和记忆成本会统一计入每日 AI 额度；额度不足时会直接提醒你。
+            </Text>
           </View>
           <AppButton
-            label="Send"
+            label="发送"
             onPress={send}
             disabled={!input.trim() || sending}
             loading={sending}
             style={[styles.sendBtn, (!input.trim() || sending) && styles.sendBtnDisabled]}
           />
         </View>
-      </ScrollView>
+      </View>
+
+      <Modal visible={sidebarOpen} animationType="fade" transparent onRequestClose={() => setSidebarOpen(false)}>
+        <View style={styles.sidebarOverlay}>
+          <Pressable style={styles.sidebarBackdrop} onPress={() => setSidebarOpen(false)} />
+          <View style={[styles.sidebarPanel, { paddingTop: insets.top + 18, paddingBottom: insets.bottom + 24 }]}>
+            <View style={styles.sidebarHeader}>
+              <View>
+                <Text style={styles.sidebarTitle}>对话侧边栏</Text>
+                <Text style={styles.sidebarSubtitle}>历史和偏好都放这里，首页只保留输入。</Text>
+              </View>
+              <Pressable style={styles.sidebarClose} onPress={() => setSidebarOpen(false)}>
+                <Ionicons name="close" size={18} color="#14213D" />
+              </Pressable>
+            </View>
+
+            <Pressable
+              style={styles.sidebarPrimaryAction}
+              onPress={() => {
+                setSidebarOpen(false);
+                void handleNewThread();
+              }}
+            >
+              <Ionicons name="add" size={16} color="#14213D" />
+              <Text style={styles.sidebarPrimaryActionText}>新会话</Text>
+            </Pressable>
+            <ScrollView
+              style={styles.sidebarScroll}
+              showsVerticalScrollIndicator={false}
+              contentContainerStyle={styles.sidebarScrollContent}
+            >
+              <View style={styles.sidebarSection}>
+                <Text style={styles.sidebarSectionTitle}>用户画像</Text>
+                <Text style={styles.sidebarSectionHint}>Bobo 当前会带着这些稳定偏好来回答你。</Text>
+                <View style={styles.memoryChipWrap}>
+                  {(profileHighlights.length ? profileHighlights : ['还没有稳定偏好']).map((chip) => (
+                    <View key={chip} style={styles.memoryChip}>
+                      <Text style={styles.memoryChipText}>{chip}</Text>
+                    </View>
+                  ))}
+                </View>
+                <View style={styles.portraitCard}>
+                  <View style={styles.portraitHeadline}>
+                    <View style={styles.portraitIcon}>
+                      <Ionicons name="person-circle-outline" size={16} color="#14213D" />
+                    </View>
+                    <Text style={styles.portraitTitle}>画像摘要</Text>
+                  </View>
+                  <View style={styles.portraitList}>
+                    {portraitRows.length ? (
+                      portraitRows.map((item) => (
+                        <View key={`${item.label}-${item.value}`} style={styles.portraitRow}>
+                          <Text style={styles.portraitLabel}>{item.label}</Text>
+                          <Text style={styles.portraitValue}>{item.value}</Text>
+                        </View>
+                      ))
+                    ) : (
+                      <Text style={styles.memoryMutedText}>还没有足够的对话和记录来形成稳定画像。</Text>
+                    )}
+                  </View>
+                </View>
+              </View>
+
+              <View style={styles.sidebarSection}>
+                <Text style={styles.sidebarSectionTitle}>长期记忆</Text>
+                <View style={styles.memoryDetailList}>
+                  {memoryHighlights.length ? (
+                    memoryHighlights.map((item) => (
+                      <View key={item} style={styles.memoryNote}>
+                        <View style={styles.memoryNoteDot} />
+                        <Text style={styles.memoryNoteText}>{item}</Text>
+                      </View>
+                    ))
+                  ) : (
+                    <Text style={styles.memoryMutedText}>当前没有更多长期记忆摘要。</Text>
+                  )}
+                </View>
+              </View>
+
+              <View style={styles.sidebarSection}>
+                <Text style={styles.sidebarSectionTitle}>上下文</Text>
+                <View style={styles.sidebarStatRow}>
+                  <View style={styles.sidebarStatCard}>
+                    <Text style={styles.sidebarStatLabel}>当前线程消息</Text>
+                    <Text style={styles.sidebarStatValue}>{activeMessages.length}</Text>
+                  </View>
+                  <View style={styles.sidebarStatCard}>
+                    <Text style={styles.sidebarStatLabel}>长期记忆条目</Text>
+                    <Text style={styles.sidebarStatValue}>{memoryItems.length}</Text>
+                  </View>
+                </View>
+              </View>
+
+              <View style={styles.sidebarSection}>
+                <Text style={styles.sidebarSectionTitle}>最近会话</Text>
+                <View style={styles.sidebarThreadList}>
+                  <Pressable
+                    style={[
+                      styles.sidebarThreadItem,
+                      styles.sidebarThreadEntryNew,
+                    ]}
+                    onPress={() => {
+                      setSidebarOpen(false);
+                      void handleNewThread();
+                    }}
+                  >
+                    <View style={styles.sidebarThreadEntryHeader}>
+                      <View style={styles.sidebarThreadEntryIcon}>
+                        <Ionicons name="add" size={14} color="#14213D" />
+                      </View>
+                      <Text style={styles.sidebarThreadTitle}>新会话</Text>
+                    </View>
+                    <Text style={styles.sidebarThreadMeta}>开启一个新的对话线程</Text>
+                  </Pressable>
+
+                  {threads.map((thread) => {
+                    const threadId = threadIdentity(thread);
+                    const selected = threadId === activeThreadId;
+                    return (
+                      <Pressable
+                        key={threadId}
+                        style={[styles.sidebarThreadItem, selected && styles.sidebarThreadItemActive]}
+                        onPress={() => {
+                          setSidebarOpen(false);
+                          void handleSelectThread(thread);
+                        }}
+                      >
+                        <Text style={[styles.sidebarThreadTitle, selected && styles.sidebarThreadTitleActive]} numberOfLines={1}>
+                          {formatDateTime(threadUpdatedAt(thread))}
+                        </Text>
+                        <Text style={[styles.sidebarThreadMeta, selected && styles.sidebarThreadMetaActive]}>
+                          {formatDateTime(threadUpdatedAt(thread))}
+                        </Text>
+                      </Pressable>
+                    );
+                  })}
+                </View>
+              </View>
+            </ScrollView>
+          </View>
+        </View>
+      </Modal>
     </View>
   );
 }
@@ -892,7 +1037,7 @@ export default function AiScreen() {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: '#FFF8FA',
+    backgroundColor: '#FBF7F2',
   },
   pageScroll: {
     flex: 1,
@@ -900,35 +1045,50 @@ const styles = StyleSheet.create({
   pageContent: {
     paddingHorizontal: 16,
   },
-  backgroundOrbOne: {
+  backgroundGlowTop: {
     position: 'absolute',
-    top: 76,
-    right: -36,
-    width: 150,
-    height: 150,
+    top: 88,
+    right: -26,
+    width: 156,
+    height: 156,
     borderRadius: 999,
-    backgroundColor: 'rgba(255, 183, 197, 0.34)',
+    backgroundColor: 'rgba(255, 183, 139, 0.22)',
   },
-  backgroundOrbTwo: {
+  backgroundGlowBottom: {
     position: 'absolute',
-    top: 260,
-    left: -54,
-    width: 132,
-    height: 132,
+    top: 300,
+    left: -44,
+    width: 144,
+    height: 144,
     borderRadius: 999,
-    backgroundColor: 'rgba(214, 255, 114, 0.22)',
+    backgroundColor: 'rgba(244, 171, 196, 0.18)',
   },
   heroCard: {
-    borderRadius: 28,
+    borderRadius: 30,
     padding: 18,
     marginBottom: 14,
     borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.75)',
-    shadowColor: '#FFB7C5',
-    shadowOffset: { width: 0, height: 14 },
-    shadowOpacity: 0.22,
-    shadowRadius: 30,
-    elevation: 9,
+    borderColor: 'rgba(255,255,255,0.82)',
+    shadowColor: '#E8BEA5',
+    shadowOffset: { width: 0, height: 18 },
+    shadowOpacity: 0.16,
+    shadowRadius: 28,
+    elevation: 8,
+  },
+  minimalHero: {
+    borderRadius: 32,
+    paddingHorizontal: 16,
+    paddingTop: 14,
+    paddingBottom: 10,
+    marginBottom: 10,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.82)',
+    shadowColor: '#E8BEA5',
+    shadowOffset: { width: 0, height: 18 },
+    shadowOpacity: 0.16,
+    shadowRadius: 28,
+    elevation: 8,
+    minHeight: 96,
   },
   heroTopRow: {
     flexDirection: 'row',
@@ -936,337 +1096,354 @@ const styles = StyleSheet.create({
     gap: 12,
     marginBottom: 14,
   },
-  heroTextBlock: {
+  heroCopy: {
     flex: 1,
   },
-  eyebrow: {
-    fontSize: 11,
-    fontWeight: '800',
-    color: 'rgba(23, 32, 51, 0.64)',
-    letterSpacing: 1.1,
-    textTransform: 'uppercase',
-    marginBottom: 6,
-  },
-  title: {
-    fontSize: 32,
-    fontWeight: '800',
-    color: '#172033',
-    marginBottom: 6,
-  },
-  subtitle: {
-    fontSize: 13,
-    color: 'rgba(23, 32, 51, 0.74)',
-    lineHeight: 19,
-  },
-  heroIconBadge: {
-    width: 38,
-    height: 38,
-    borderRadius: 19,
-    backgroundColor: 'rgba(255,255,255,0.62)',
-    alignItems: 'center',
-    justifyContent: 'center',
-    borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.78)',
-  },
-  metricRow: {
+  minimalTopbar: {
     flexDirection: 'row',
-    gap: 10,
-    marginBottom: 14,
+    justifyContent: 'space-between',
+    alignItems: 'flex-start',
+    gap: 12,
+    marginBottom: 0,
   },
-  metricCard: {
+  minimalBrandBlock: {
     flex: 1,
+  },
+  sidebarTrigger: {
+    width: 36,
+    height: 36,
     borderRadius: 18,
-    paddingHorizontal: 12,
-    paddingVertical: 12,
-    backgroundColor: 'rgba(255,255,255,0.58)',
-    borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.74)',
-  },
-  metricLabel: {
-    fontSize: 11,
-    color: 'rgba(23, 32, 51, 0.58)',
-    fontWeight: '700',
-    marginBottom: 8,
-  },
-  metricValue: {
-    fontSize: 24,
-    fontWeight: '800',
-    color: '#172033',
-  },
-  metricValueSmall: {
-    fontSize: 18,
-    fontWeight: '800',
-    color: '#172033',
-  },
-  metricMeta: {
-    marginTop: 2,
-    fontSize: 11,
-    color: 'rgba(23, 32, 51, 0.52)',
-  },
-  headerActions: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 8,
-  },
-  headerChipStrong: {
-    borderRadius: 999,
-    paddingHorizontal: 14,
-    paddingVertical: 10,
-    backgroundColor: '#D6FF72',
-    borderWidth: 1,
-    borderColor: 'rgba(154, 230, 0, 0.72)',
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6,
-  },
-  headerChipStrongText: {
-    fontSize: 12,
-    fontWeight: '800',
-    color: '#172033',
-  },
-  headerChipSoft: {
-    borderRadius: 999,
-    paddingHorizontal: 14,
-    paddingVertical: 10,
-    backgroundColor: 'rgba(255,255,255,0.62)',
-    borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.72)',
-  },
-  headerChipSoftText: {
-    fontSize: 12,
-    fontWeight: '700',
-    color: '#172033',
-  },
-  sectionBlock: {
-    marginBottom: 12,
-  },
-  threadStrip: {
-    gap: 10,
-    paddingBottom: 2,
-    paddingRight: 12,
-  },
-  threadCard: {
-    minWidth: 140,
-    maxWidth: 188,
-    borderRadius: 20,
-    paddingHorizontal: 14,
-    paddingVertical: 14,
-    backgroundColor: 'rgba(255,255,255,0.78)',
-    borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.92)',
-    shadowColor: '#EAB7C5',
-    shadowOffset: { width: 0, height: 8 },
-    shadowOpacity: 0.1,
-    shadowRadius: 20,
-    elevation: 4,
-  },
-  threadCardActive: {
-    backgroundColor: 'transparent',
-    borderColor: 'transparent',
-    paddingHorizontal: 0,
-    paddingVertical: 0,
-  },
-  threadCardGradient: {
-    minWidth: 140,
-    maxWidth: 188,
-    borderRadius: 20,
-    paddingHorizontal: 14,
-    paddingVertical: 14,
-  },
-  threadCardTitle: {
-    fontSize: 13,
-    fontWeight: '800',
-    color: '#172033',
-  },
-  threadCardTitleActive: {
-    color: '#FFFFFF',
-  },
-  threadCardMeta: {
-    marginTop: 6,
-    fontSize: 11,
-    color: '#6B7280',
-  },
-  threadCardMetaActive: {
-    color: 'rgba(255,255,255,0.78)',
-  },
-  threadCardTimestamp: {
-    marginTop: 18,
-    fontSize: 10,
-    color: 'rgba(107, 114, 128, 0.85)',
-  },
-  memoryPanel: {
-    borderRadius: 24,
-    padding: 14,
     backgroundColor: 'rgba(255,255,255,0.74)',
     borderWidth: 1,
     borderColor: 'rgba(255,255,255,0.9)',
-    marginBottom: 10,
-    shadowColor: '#F4C2CF',
-    shadowOffset: { width: 0, height: 8 },
-    shadowOpacity: 0.08,
-    shadowRadius: 18,
-    elevation: 3,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
-  memoryPanelExpanded: {
-    paddingBottom: 16,
+  eyebrow: {
+    fontSize: 10,
+    fontWeight: '800',
+    color: 'rgba(20, 33, 61, 0.52)',
+    letterSpacing: 1,
+    textTransform: 'uppercase',
+    marginBottom: 4,
+  },
+  title: {
+    fontSize: 28,
+    fontWeight: '800',
+    color: '#14213D',
+    marginBottom: 4,
+  },
+  subtitle: {
+    fontSize: 13,
+    lineHeight: 19,
+    color: 'rgba(20, 33, 61, 0.7)',
+  },
+  heroBadge: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: 'rgba(255,255,255,0.7)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.88)',
+  },
+  signalStack: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+    marginBottom: 12,
+  },
+  signalPillStrong: {
+    borderRadius: 18,
+    paddingHorizontal: 14,
+    paddingVertical: 11,
+    backgroundColor: '#14213D',
+    minWidth: 120,
+  },
+  signalLabelStrong: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: 'rgba(255,255,255,0.7)',
+    marginBottom: 4,
+  },
+  signalValueStrong: {
+    fontSize: 18,
+    fontWeight: '800',
+    color: '#FFFFFF',
+  },
+  signalPill: {
+    borderRadius: 18,
+    paddingHorizontal: 14,
+    paddingVertical: 11,
+    backgroundColor: 'rgba(255,255,255,0.65)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.82)',
+    minWidth: 108,
+  },
+  signalLabel: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: 'rgba(20, 33, 61, 0.58)',
+    marginBottom: 4,
+  },
+  signalValue: {
+    fontSize: 18,
+    fontWeight: '800',
+    color: '#14213D',
+  },
+  heroHint: {
+    fontSize: 13,
+    lineHeight: 20,
+    color: 'rgba(20, 33, 61, 0.76)',
+    marginBottom: 14,
+  },
+  heroActions: {
+    flexDirection: 'row',
+    gap: 10,
+  },
+  primaryAction: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    borderRadius: 999,
+    paddingHorizontal: 16,
+    paddingVertical: 11,
+    backgroundColor: '#E6FF7A',
+    borderWidth: 1,
+    borderColor: 'rgba(170, 209, 54, 0.72)',
+  },
+  primaryActionText: {
+    fontSize: 13,
+    fontWeight: '800',
+    color: '#14213D',
+  },
+  secondaryAction: {
+    borderRadius: 999,
+    paddingHorizontal: 16,
+    paddingVertical: 11,
+    backgroundColor: 'rgba(255,255,255,0.68)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.86)',
+  },
+  secondaryActionText: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: '#14213D',
+  },
+  emptyStage: {
+    marginBottom: 12,
+  },
+  section: {
+    marginBottom: 12,
   },
   sectionHeader: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'flex-start',
-    gap: 10,
-    marginBottom: 12,
+    gap: 12,
+    marginBottom: 10,
   },
   sectionTitle: {
     fontSize: 16,
     fontWeight: '800',
-    color: '#172033',
+    color: '#14213D',
   },
   sectionCaption: {
-    marginTop: 3,
+    marginTop: 4,
     fontSize: 12,
     color: '#6B7280',
   },
-  sectionActions: {
+  threadRail: {
+    gap: 10,
+    paddingRight: 10,
+  },
+  threadChip: {
+    width: 156,
+    borderRadius: 22,
+    paddingHorizontal: 14,
+    paddingVertical: 14,
+    backgroundColor: 'rgba(255,255,255,0.8)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.9)',
+    shadowColor: '#E7D9D1',
+    shadowOffset: { width: 0, height: 8 },
+    shadowOpacity: 0.08,
+    shadowRadius: 20,
+    elevation: 4,
+  },
+  threadChipActive: {
+    backgroundColor: '#18233D',
+    borderColor: '#18233D',
+  },
+  threadChipTitle: {
+    fontSize: 13,
+    fontWeight: '800',
+    color: '#14213D',
+    marginBottom: 10,
+  },
+  threadChipTitleActive: {
+    color: '#FFFFFF',
+  },
+  threadChipMeta: {
+    fontSize: 11,
+    color: '#6B7280',
+  },
+  threadChipMetaActive: {
+    color: 'rgba(255,255,255,0.74)',
+  },
+  memoryCard: {
+    borderRadius: 26,
+    padding: 16,
+    backgroundColor: 'rgba(255,255,255,0.78)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.9)',
+    marginBottom: 12,
+    shadowColor: '#E7D9D1',
+    shadowOffset: { width: 0, height: 10 },
+    shadowOpacity: 0.08,
+    shadowRadius: 22,
+    elevation: 4,
+  },
+  memoryChipWrap: {
     flexDirection: 'row',
+    flexWrap: 'wrap',
     gap: 8,
   },
-  inlineChip: {
-    borderRadius: 999,
-    paddingHorizontal: 10,
-    paddingVertical: 7,
-    backgroundColor: 'rgba(246,247,251,0.95)',
-  },
-  inlineChipText: {
-    fontSize: 12,
-    fontWeight: '700',
-    color: '#172033',
-  },
-  inlineChipAccent: {
+  memoryChip: {
     borderRadius: 999,
     paddingHorizontal: 12,
     paddingVertical: 9,
-    backgroundColor: '#EEF9C7',
+    backgroundColor: '#FFF9EC',
     borderWidth: 1,
-    borderColor: 'rgba(173,255,47,0.48)',
+    borderColor: 'rgba(255, 214, 120, 0.44)',
   },
-  inlineChipAccentText: {
-    fontSize: 12,
-    fontWeight: '800',
-    color: '#172033',
+  memoryChipText: {
+    fontSize: 13,
+    color: '#14213D',
   },
-  inlineDangerChip: {
-    backgroundColor: '#FEE2E2',
-  },
-  inlineDangerChipText: {
-    color: '#991B1B',
-  },
-  profileChipWrap: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 8,
-  },
-  quickActions: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 8,
+  memoryDetailList: {
     marginTop: 14,
+    gap: 10,
+  },
+  portraitCard: {
+    marginTop: 14,
+    borderRadius: 18,
+    padding: 13,
+    backgroundColor: '#F7F3ED',
+    borderWidth: 1,
+    borderColor: 'rgba(226, 213, 196, 0.9)',
+  },
+  portraitHeadline: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
     marginBottom: 10,
   },
-  profileChip: {
+  portraitIcon: {
+    width: 28,
+    height: 28,
     borderRadius: 14,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    backgroundColor: '#FFFDF7',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#FFF8EA',
     borderWidth: 1,
-    borderColor: 'rgba(255, 210, 159, 0.44)',
+    borderColor: 'rgba(240, 203, 140, 0.6)',
   },
-  profileChipText: {
+  portraitTitle: {
+    fontSize: 12,
+    fontWeight: '800',
+    color: '#7A828E',
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
+  },
+  portraitList: {
+    gap: 10,
+  },
+  portraitRow: {
+    gap: 4,
+  },
+  portraitLabel: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#7A828E',
+  },
+  portraitValue: {
     fontSize: 13,
-    lineHeight: 18,
-    color: '#172033',
+    lineHeight: 19,
+    color: '#243042',
   },
-  memoryList: {
-    gap: 10,
-    marginTop: 4,
-  },
-  memoryCard: {
-    borderRadius: 18,
-    padding: 12,
-    backgroundColor: 'rgba(255,255,255,0.82)',
-    borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.94)',
-  },
-  memoryCardTop: {
+  memoryNote: {
     flexDirection: 'row',
-    gap: 10,
     alignItems: 'flex-start',
-    justifyContent: 'space-between',
+    gap: 10,
   },
-  memoryContent: {
+  memoryNoteDot: {
+    width: 7,
+    height: 7,
+    borderRadius: 999,
+    backgroundColor: '#F1B54C',
+    marginTop: 6,
+  },
+  memoryNoteText: {
     flex: 1,
     fontSize: 13,
     lineHeight: 19,
-    color: '#172033',
+    color: '#495364',
   },
-  memoryBadge: {
-    fontSize: 11,
-    fontWeight: '800',
-    color: '#AD5E00',
-    backgroundColor: '#FFF4D4',
-    borderRadius: 999,
-    paddingHorizontal: 8,
-    paddingVertical: 4,
-    overflow: 'hidden',
-  },
-  memoryMeta: {
-    marginTop: 8,
-    fontSize: 12,
+  memoryMutedText: {
+    fontSize: 13,
     color: '#6B7280',
   },
-  memoryActions: {
+  syncNote: {
     flexDirection: 'row',
+    alignItems: 'center',
     gap: 8,
-    marginTop: 10,
-  },
-  warnText: {
-    fontSize: 12,
-    color: '#B45309',
-    marginBottom: 8,
-    paddingHorizontal: 4,
-  },
-  chatPanel: {
-    borderRadius: 28,
-    backgroundColor: 'rgba(255,255,255,0.78)',
-    borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.92)',
-    overflow: 'hidden',
-    shadowColor: '#D8DEE9',
-    shadowOffset: { width: 0, height: 14 },
-    shadowOpacity: 0.12,
-    shadowRadius: 26,
-    elevation: 6,
+    borderRadius: 14,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    backgroundColor: '#FFF4DF',
     marginBottom: 12,
   },
-  chatPanelHeader: {
+  syncNoteText: {
+    flex: 1,
+    fontSize: 12,
+    lineHeight: 18,
+    color: '#9A5B13',
+  },
+  chatPanel: {
+    borderRadius: 30,
+    backgroundColor: 'rgba(255,255,255,0.84)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.9)',
+    overflow: 'hidden',
+    shadowColor: '#D8DEE9',
+    shadowOffset: { width: 0, height: 16 },
+    shadowOpacity: 0.12,
+    shadowRadius: 26,
+    elevation: 7,
+  },
+  chatHeader: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
+    gap: 12,
     paddingHorizontal: 16,
     paddingTop: 16,
     paddingBottom: 10,
   },
-  chatPanelTitle: {
-    fontSize: 16,
+  chatTitle: {
+    fontSize: 15,
     fontWeight: '800',
-    color: '#172033',
+    color: '#14213D',
   },
-  chatPanelCaption: {
+  chatCaption: {
     marginTop: 4,
-    fontSize: 12,
+    fontSize: 11,
+    lineHeight: 16,
     color: '#6B7280',
   },
-  chatStatusPill: {
+  statusPill: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 6,
@@ -1275,58 +1452,77 @@ const styles = StyleSheet.create({
     paddingVertical: 7,
     backgroundColor: '#F8FAFC',
     borderWidth: 1,
-    borderColor: '#ECF1F5',
+    borderColor: '#E8EDF3',
   },
-  chatStatusDot: {
+  statusDot: {
     width: 8,
     height: 8,
     borderRadius: 999,
-    backgroundColor: '#58C27D',
+    backgroundColor: '#55B46A',
   },
-  chatStatusDotBusy: {
-    backgroundColor: '#F59E0B',
+  statusDotBusy: {
+    backgroundColor: '#F1B54C',
   },
-  chatStatusText: {
+  statusText: {
     fontSize: 11,
     fontWeight: '700',
-    color: '#172033',
+    color: '#14213D',
   },
   chatArea: {
     paddingHorizontal: 14,
-    paddingBottom: 18,
+    paddingBottom: 20,
   },
   emptyState: {
-    paddingVertical: 16,
+    paddingVertical: 18,
     gap: 8,
     alignItems: 'center',
   },
   welcomeCard: {
-    borderRadius: 22,
-    padding: 16,
+    borderRadius: 20,
+    paddingHorizontal: 14,
+    paddingVertical: 13,
     marginTop: 4,
-    marginBottom: 14,
-    backgroundColor: '#FFFDF7',
+    backgroundColor: '#FFF9F1',
     borderWidth: 1,
-    borderColor: 'rgba(255, 214, 114, 0.34)',
+    borderColor: 'rgba(255, 214, 120, 0.34)',
   },
   welcomeEyebrow: {
-    fontSize: 11,
+    fontSize: 10,
     fontWeight: '800',
-    color: '#AD5E00',
+    color: '#A86A18',
     letterSpacing: 0.9,
     textTransform: 'uppercase',
-    marginBottom: 8,
+    marginBottom: 6,
   },
   welcomeTitle: {
-    fontSize: 18,
+    fontSize: 16,
     fontWeight: '800',
-    color: '#172033',
-    marginBottom: 8,
+    color: '#14213D',
+    marginBottom: 10,
   },
-  welcomeText: {
+  promptGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+    justifyContent: 'space-between',
+  },
+  promptCard: {
+    borderRadius: 16,
+    paddingHorizontal: 12,
+    paddingVertical: 11,
+    width: '48%',
+    backgroundColor: 'rgba(255,255,255,0.74)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.92)',
+  },
+  promptCardText: {
     fontSize: 13,
-    lineHeight: 20,
-    color: '#4B5563',
+    lineHeight: 18,
+    color: '#14213D',
+    fontWeight: '700',
+  },
+  chatPanelCompact: {
+    minHeight: 120,
   },
   messageRow: {
     flexDirection: 'row',
@@ -1337,78 +1533,146 @@ const styles = StyleSheet.create({
   messageRowUser: {
     justifyContent: 'flex-end',
   },
-  messageRowAi: {
+  messageRowAssistant: {
     justifyContent: 'flex-start',
   },
-  avatarDotWrap: {
-    width: 28,
-    alignItems: 'center',
-    paddingTop: 4,
-  },
-  avatarDot: {
+  avatar: {
     width: 26,
     height: 26,
     borderRadius: 13,
     alignItems: 'center',
     justifyContent: 'center',
-  },
-  avatarDotUser: {
-    backgroundColor: '#D6FF72',
-  },
-  avatarDotAi: {
-    backgroundColor: '#172033',
+    backgroundColor: '#14213D',
+    marginTop: 4,
   },
   bubble: {
-    borderRadius: 20,
+    maxWidth: '84%',
+    borderRadius: 22,
     paddingHorizontal: 14,
     paddingVertical: 12,
-    maxWidth: '86%',
   },
   userBubble: {
-    backgroundColor: '#172033',
+    backgroundColor: '#E8FF86',
     borderTopRightRadius: 8,
   },
-  aiBubble: {
-    backgroundColor: '#F3F6FA',
+  assistantBubble: {
+    backgroundColor: '#FFFFFF',
     borderTopLeftRadius: 8,
     borderWidth: 1,
-    borderColor: '#E9EEF5',
+    borderColor: '#EEF1F4',
   },
-  thinkingBubble: {
+  thinkingCard: {
+    width: '84%',
+    maxWidth: '84%',
+    minWidth: 196,
+    borderRadius: 22,
+    paddingHorizontal: 14,
+    paddingVertical: 13,
+    backgroundColor: 'rgba(255,255,255,0.98)',
+    borderWidth: 1,
+    borderColor: '#EEF1F4',
+    shadowColor: '#D8DEE9',
+    shadowOffset: { width: 0, height: 8 },
+    shadowOpacity: 0.1,
+    shadowRadius: 18,
+    elevation: 4,
+    overflow: 'hidden',
+  },
+  thinkingHeader: {
     flexDirection: 'row',
     alignItems: 'center',
+    gap: 10,
+    marginBottom: 12,
+  },
+  thinkingPulse: {
+    width: 30,
+    height: 30,
+    borderRadius: 15,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#F3F6FB',
+    borderWidth: 1,
+    borderColor: '#E6ECF5',
+  },
+  thinkingCopy: {
+    flex: 1,
+    gap: 3,
+  },
+  thinkingTitle: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: '#243042',
+  },
+  thinkingSubtitle: {
+    fontSize: 11,
+    lineHeight: 16,
+    color: '#7A828E',
+  },
+  thinkingSkeleton: {
     gap: 8,
+  },
+  shimmerBar: {
+    height: 10,
+    borderRadius: 999,
+    backgroundColor: '#EEF2F7',
+    overflow: 'hidden',
+  },
+  shimmerBarWide: {
+    width: '88%',
+  },
+  shimmerBarMedium: {
+    width: '72%',
+  },
+  shimmerBarShort: {
+    width: '58%',
+  },
+  shimmerSweep: {
+    ...StyleSheet.absoluteFillObject,
+    width: 160,
+  },
+  shimmerGradient: {
+    flex: 1,
+  },
+  userText: {
+    fontSize: 14,
+    lineHeight: 21,
+    color: '#14213D',
+  },
+  assistantText: {
+    fontSize: 14,
+    lineHeight: 21,
+    color: '#243042',
   },
   menuResults: {
-    marginTop: 10,
-    gap: 8,
+    marginTop: 12,
+    gap: 10,
   },
   menuCard: {
-    borderRadius: 14,
-    padding: 10,
-    backgroundColor: '#FFFFFF',
+    borderRadius: 16,
+    padding: 12,
+    backgroundColor: '#F8FAFC',
     borderWidth: 1,
-    borderColor: '#EDF0F5',
+    borderColor: '#EBF0F4',
   },
   menuCardTop: {
     flexDirection: 'row',
     justifyContent: 'space-between',
-    gap: 8,
-    alignItems: 'center',
+    gap: 12,
+    alignItems: 'flex-start',
   },
   menuName: {
     flex: 1,
-    fontSize: 14,
-    fontWeight: '700',
-    color: '#172033',
+    fontSize: 13,
+    fontWeight: '800',
+    color: '#14213D',
   },
   menuPrice: {
     fontSize: 13,
-    fontWeight: '700',
-    color: '#B45309',
+    fontWeight: '800',
+    color: '#A86A18',
   },
   menuMeta: {
-    marginTop: 4,
+    marginTop: 6,
     fontSize: 12,
     color: '#6B7280',
   },
@@ -1416,67 +1680,228 @@ const styles = StyleSheet.create({
     marginTop: 6,
     fontSize: 12,
     lineHeight: 18,
-    color: '#374151',
+    color: '#4B5563',
   },
-  userText: {
-    color: '#FFFFFF',
-    fontSize: 14,
-    lineHeight: 20,
+  composerWrap: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    paddingHorizontal: 14,
+    paddingTop: 8,
+    backgroundColor: 'transparent',
   },
-  aiText: {
-    color: '#172033',
-    fontSize: 14,
-    lineHeight: 21,
-  },
-  inputBar: {
+  composerCard: {
+    borderRadius: 24,
+    padding: 10,
     flexDirection: 'row',
     alignItems: 'flex-end',
     gap: 10,
-    marginTop: 2,
+    backgroundColor: 'rgba(255,255,255,0.92)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.96)',
+    shadowColor: '#D8DEE9',
+    shadowOffset: { width: 0, height: 8 },
+    shadowOpacity: 0.12,
+    shadowRadius: 20,
+    elevation: 8,
   },
   inputShell: {
     flex: 1,
-    borderRadius: 22,
-    backgroundColor: 'rgba(255,255,255,0.94)',
-    borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.98)',
+    borderRadius: 18,
     paddingHorizontal: 14,
     paddingTop: 12,
     paddingBottom: 10,
-    shadowColor: '#E6E9F0',
-    shadowOffset: { width: 0, height: 10 },
-    shadowOpacity: 0.12,
-    shadowRadius: 20,
-    elevation: 6,
+    backgroundColor: '#F7F8FA',
   },
   input: {
-    minHeight: 24,
-    fontSize: 14,
-    color: '#172033',
-    paddingVertical: 0,
+    minHeight: 22,
+    maxHeight: 96,
+    fontSize: 15,
+    color: '#14213D',
   },
   inputHint: {
-    marginTop: 8,
+    marginTop: 6,
     fontSize: 11,
-    color: '#9CA3AF',
+    lineHeight: 16,
+    color: '#7A828E',
   },
   sendBtn: {
-    minWidth: 92,
-    marginBottom: 2,
+    minWidth: 88,
+    borderRadius: 18,
   },
   sendBtnDisabled: {
-    opacity: 0.4,
+    opacity: 0.45,
   },
   tip: {
-    fontSize: 14,
+    fontSize: 13,
     color: '#6B7280',
-  },
-  loginBtn: {
-    marginTop: 10,
+    lineHeight: 19,
   },
   errorText: {
-    marginTop: 10,
-    color: '#B91C1C',
+    color: '#C2410C',
+    marginTop: 12,
+  },
+  loginBtn: {
+    marginTop: 18,
+  },
+  sidebarOverlay: {
+    flex: 1,
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    backgroundColor: 'rgba(20, 33, 61, 0.16)',
+  },
+  sidebarBackdrop: {
+    flex: 1,
+  },
+  sidebarPanel: {
+    width: '86%',
+    maxWidth: 380,
+    backgroundColor: '#FFFDF9',
+    paddingHorizontal: 18,
+    borderTopLeftRadius: 28,
+    borderBottomLeftRadius: 28,
+    borderLeftWidth: 1,
+    borderColor: 'rgba(230, 219, 208, 0.88)',
+    shadowColor: '#AE9B8B',
+    shadowOffset: { width: -10, height: 0 },
+    shadowOpacity: 0.14,
+    shadowRadius: 28,
+    elevation: 12,
+  },
+  sidebarHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'flex-start',
+    gap: 12,
+    marginBottom: 18,
+  },
+  sidebarTitle: {
+    fontSize: 22,
+    fontWeight: '800',
+    color: '#14213D',
+    marginBottom: 6,
+  },
+  sidebarSubtitle: {
+    fontSize: 12,
+    lineHeight: 18,
+    color: '#6B7280',
+  },
+  sidebarClose: {
+    width: 38,
+    height: 38,
+    borderRadius: 19,
+    backgroundColor: '#F5F2ED',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  sidebarPrimaryAction: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    borderRadius: 18,
+    paddingVertical: 14,
+    backgroundColor: '#E6FF7A',
+    borderWidth: 1,
+    borderColor: 'rgba(170, 209, 54, 0.72)',
+    marginBottom: 18,
+  },
+  sidebarPrimaryActionText: {
+    fontSize: 14,
+    fontWeight: '800',
+    color: '#14213D',
+  },
+  sidebarScroll: {
+    flex: 1,
+  },
+  sidebarScrollContent: {
+    paddingBottom: 8,
+  },
+  sidebarSection: {
+    marginBottom: 18,
+  },
+  sidebarSectionTitle: {
+    fontSize: 14,
+    fontWeight: '800',
+    color: '#14213D',
+    marginBottom: 10,
+  },
+  sidebarSectionHint: {
+    marginTop: -2,
+    marginBottom: 10,
+    fontSize: 12,
+    lineHeight: 18,
+    color: '#6B7280',
+  },
+  sidebarStatRow: {
+    flexDirection: 'row',
+    gap: 10,
+  },
+  sidebarStatCard: {
+    flex: 1,
+    borderRadius: 18,
+    padding: 12,
+    backgroundColor: '#F7F3ED',
+  },
+  sidebarStatLabel: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: '#7A828E',
+    marginBottom: 6,
+  },
+  sidebarStatValue: {
+    fontSize: 17,
+    fontWeight: '800',
+    color: '#14213D',
+  },
+  sidebarThreadList: {
+    gap: 10,
+    paddingBottom: 6,
+  },
+  sidebarThreadItem: {
+    borderRadius: 18,
+    paddingHorizontal: 14,
+    paddingVertical: 13,
+    backgroundColor: '#F7F3ED',
+  },
+  sidebarThreadEntryNew: {
+    backgroundColor: '#FFF9E8',
+    borderWidth: 1,
+    borderColor: 'rgba(241, 181, 76, 0.28)',
+  },
+  sidebarThreadEntryHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    marginBottom: 6,
+  },
+  sidebarThreadEntryIcon: {
+    width: 22,
+    height: 22,
+    borderRadius: 11,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#E6FF7A',
+    borderWidth: 1,
+    borderColor: 'rgba(170, 209, 54, 0.6)',
+  },
+  sidebarThreadItemActive: {
+    backgroundColor: '#18233D',
+  },
+  sidebarThreadTitle: {
     fontSize: 13,
+    fontWeight: '800',
+    color: '#14213D',
+    marginBottom: 6,
+  },
+  sidebarThreadTitleActive: {
+    color: '#FFFFFF',
+  },
+  sidebarThreadMeta: {
+    fontSize: 11,
+    color: '#6B7280',
+  },
+  sidebarThreadMetaActive: {
+    color: 'rgba(255,255,255,0.74)',
   },
 });

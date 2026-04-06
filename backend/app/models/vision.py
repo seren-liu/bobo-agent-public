@@ -5,6 +5,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+UploadSourceType = Literal["photo", "screenshot", "manual"]
+
 
 class DrinkItem(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -25,6 +27,10 @@ class VisionResult(BaseModel):
     source_type: Literal["photo", "screenshot"]
     order_time: datetime | None = None
     error: Literal["recognition_failed", "parse_error"] | None = None
+    degraded: bool = False
+    fallback_mode: Literal["manual_entry"] | None = None
+    retryable: bool | None = None
+    message: str | None = None
 
 
 class UploadURLRequest(BaseModel):
@@ -32,6 +38,10 @@ class UploadURLRequest(BaseModel):
 
     filename: str
     content_type: str
+    file_size: int = Field(gt=0)
+    width: int = Field(gt=0)
+    height: int = Field(gt=0)
+    source_type: UploadSourceType
 
 
 class UploadURLResponse(BaseModel):

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from copy import deepcopy
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Any
 from uuid import uuid4
 
@@ -16,6 +16,7 @@ _LOCAL_SUMMARIES: dict[str, list[dict[str, Any]]] = {}
 _LOCAL_PROFILES: dict[str, dict[str, Any]] = {}
 _LOCAL_MEMORIES: dict[str, list[dict[str, Any]]] = {}
 _LOCAL_JOBS: list[dict[str, Any]] = []
+_LOCAL_DAILY_LLM_USAGE: dict[tuple[str, str, str], dict[str, Any]] = {}
 
 
 def _utcnow() -> datetime:
@@ -407,6 +408,100 @@ def save_summary(
         )
         row = cur.fetchone()
         cur.execute("UPDATE agent_threads SET last_summary_at = NOW(), updated_at = NOW() WHERE id = %s::uuid", (thread["id"],))
+        conn.commit()
+    return row or {}
+
+
+def get_daily_llm_usage(user_id: str, usage_date: date, model: str) -> dict[str, Any]:
+    usage_day = usage_date.isoformat()
+    if not has_pool():
+        return deepcopy(
+            _LOCAL_DAILY_LLM_USAGE.get(
+                (user_id, usage_day, model),
+                {
+                    "user_id": user_id,
+                    "usage_date": usage_day,
+                    "model": model,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "estimated_cost_cny": 0.0,
+                },
+            )
+        )
+
+    sql = """
+    SELECT user_id::text AS user_id, usage_date, model, input_tokens, output_tokens,
+           estimated_cost_cny::float8 AS estimated_cost_cny, created_at, updated_at
+    FROM user_daily_llm_usage
+    WHERE user_id = %s::uuid AND usage_date = %s AND model = %s
+    """
+    pool = get_pool()
+    assert pool is not None
+    with pool.connection() as conn, conn.cursor() as cur:
+        cur.execute(sql, (user_id, usage_day, model))
+        row = cur.fetchone()
+    if row:
+        return row
+    return {
+        "user_id": user_id,
+        "usage_date": usage_day,
+        "model": model,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "estimated_cost_cny": 0.0,
+    }
+
+
+def add_daily_llm_usage(
+    *,
+    user_id: str,
+    usage_date: date,
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    estimated_cost_cny: float,
+) -> dict[str, Any]:
+    usage_day = usage_date.isoformat()
+    if not has_pool():
+        key = (user_id, usage_day, model)
+        current = deepcopy(
+            _LOCAL_DAILY_LLM_USAGE.get(
+                key,
+                {
+                    "user_id": user_id,
+                    "usage_date": usage_day,
+                    "model": model,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "estimated_cost_cny": 0.0,
+                },
+            )
+        )
+        current["input_tokens"] = int(current.get("input_tokens") or 0) + max(int(input_tokens or 0), 0)
+        current["output_tokens"] = int(current.get("output_tokens") or 0) + max(int(output_tokens or 0), 0)
+        current["estimated_cost_cny"] = round(float(current.get("estimated_cost_cny") or 0.0) + max(float(estimated_cost_cny or 0.0), 0.0), 6)
+        _LOCAL_DAILY_LLM_USAGE[key] = current
+        return deepcopy(current)
+
+    sql = """
+    INSERT INTO user_daily_llm_usage (user_id, usage_date, model, input_tokens, output_tokens, estimated_cost_cny)
+    VALUES (%s::uuid, %s, %s, %s, %s, %s)
+    ON CONFLICT (user_id, usage_date, model) DO UPDATE SET
+      input_tokens = user_daily_llm_usage.input_tokens + EXCLUDED.input_tokens,
+      output_tokens = user_daily_llm_usage.output_tokens + EXCLUDED.output_tokens,
+      estimated_cost_cny = user_daily_llm_usage.estimated_cost_cny + EXCLUDED.estimated_cost_cny,
+      updated_at = NOW()
+    RETURNING user_id::text AS user_id, usage_date, model, input_tokens, output_tokens,
+              estimated_cost_cny::float8 AS estimated_cost_cny, created_at, updated_at
+    """
+    pool = get_pool()
+    assert pool is not None
+    with pool.connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            sql,
+            (user_id, usage_day, model, max(int(input_tokens or 0), 0), max(int(output_tokens or 0), 0), max(float(estimated_cost_cny or 0.0), 0.0)),
+        )
+        row = cur.fetchone()
         conn.commit()
     return row or {}
 

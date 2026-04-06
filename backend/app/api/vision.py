@@ -6,6 +6,7 @@ import logging
 from fastapi import APIRouter, HTTPException, Request
 
 from app.models.vision import RecognizeRequest, UploadURLRequest, UploadURLResponse, VisionResult
+from app.observability import observe_vision_request
 from app.services.cos import COSService
 from app.services.vision import VisionService
 
@@ -28,6 +29,10 @@ def get_upload_url(payload: UploadURLRequest, request: Request) -> UploadURLResp
                 "user_id": user_id,
                 "filename": payload.filename,
                 "content_type": payload.content_type,
+                "file_size": payload.file_size,
+                "width": payload.width,
+                "height": payload.height,
+                "source_type": payload.source_type,
             },
             ensure_ascii=False,
             default=str,
@@ -38,6 +43,10 @@ def get_upload_url(payload: UploadURLRequest, request: Request) -> UploadURLResp
             filename=payload.filename,
             content_type=payload.content_type,
             user_id=user_id,
+            file_size=payload.file_size,
+            width=payload.width,
+            height=payload.height,
+            source_type=payload.source_type,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -65,6 +74,12 @@ def recognize(payload: RecognizeRequest, request: Request) -> VisionResult:
         image_url=readable_url,
         source_type=payload.source_type,
         request_id=request_id,
+    )
+    observe_vision_request(
+        source_type=payload.source_type,
+        outcome=result.error or "success",
+        item_count=len(result.items),
+        low_confidence_count=sum(1 for item in result.items if item.brand is None and item.name is None),
     )
     logger.info(
         json.dumps(

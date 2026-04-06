@@ -27,16 +27,39 @@ usage() {
 Usage:
   bash scripts/run_mobile_local.sh simulator [--no-clear]
   bash scripts/run_mobile_local.sh device [YOUR_MAC_LAN_IP] [--no-clear]
+  bash scripts/run_mobile_local.sh logs
 
 Examples:
   bash scripts/run_mobile_local.sh simulator
   bash scripts/run_mobile_local.sh simulator --no-clear
   bash scripts/run_mobile_local.sh device <your-mac-lan-ip>
+  bash scripts/run_mobile_local.sh logs
 EOF
 }
 
 compose() {
-  docker compose -f "$BASE_COMPOSE" -f "$LOCAL_COMPOSE" "$@"
+  if [[ -f "$LOCAL_ENV" ]]; then
+    docker compose --env-file "$LOCAL_ENV" -f "$BASE_COMPOSE" -f "$LOCAL_COMPOSE" "$@"
+  else
+    docker compose -f "$BASE_COMPOSE" -f "$LOCAL_COMPOSE" "$@"
+  fi
+}
+
+is_host_port_open() {
+  local port=$1
+  python3 - <<PY >/dev/null 2>&1
+import socket
+sock = socket.socket()
+sock.settimeout(0.5)
+try:
+    sock.connect(("127.0.0.1", int("$port")))
+except OSError:
+    raise SystemExit(1)
+else:
+    raise SystemExit(0)
+finally:
+    sock.close()
+PY
 }
 
 detect_ip() {
@@ -67,9 +90,17 @@ ensure_base_services() {
     fi
   done
 
+  if [[ "$need_start" == "false" ]]; then
+    if ! is_host_port_open "${LOCAL_POSTGRES_PORT:-15432}" \
+      || ! is_host_port_open "${LOCAL_REDIS_PORT:-16379}" \
+      || ! is_host_port_open "${LOCAL_QDRANT_HTTP_PORT:-16333}"; then
+      need_start="true"
+    fi
+  fi
+
   if [[ "$need_start" == "true" ]]; then
-    echo "[run-mobile] 正在启动缺失的基础服务..."
-    compose up -d postgres redis qdrant
+    echo "[run-mobile] 正在启动或重建本地基础服务..."
+    compose up -d --force-recreate postgres redis qdrant
   fi
 }
 
@@ -89,8 +120,11 @@ start_backend() {
 
   # shellcheck disable=SC1091
   source .venv/bin/activate
-  pip install -q --upgrade pip
-  pip install -q -e ".[all]"
+  if ! python -m pip --version >/dev/null 2>&1; then
+    python -m ensurepip --upgrade
+  fi
+  python -m pip install -q --upgrade pip
+  python -m pip install -q -e ".[all]"
 
   set -a
   # shellcheck disable=SC1090
@@ -140,6 +174,18 @@ mode="${1:-}"
 if [[ -z "$mode" ]]; then
   usage
   exit 1
+fi
+
+if [[ "$mode" == "logs" ]]; then
+  if [[ ! -f "$BACKEND_LOG" ]]; then
+    echo "[run-mobile] 后端日志不存在: $BACKEND_LOG"
+    echo "[run-mobile] 先运行: bash scripts/run_mobile_local.sh simulator"
+    echo "[run-mobile] 或者: bash scripts/run_mobile_local.sh device"
+    exit 1
+  fi
+  echo "[run-mobile] 正在查看后端日志: $BACKEND_LOG"
+  tail -f "$BACKEND_LOG"
+  exit 0
 fi
 
 clear_flag="--clear"

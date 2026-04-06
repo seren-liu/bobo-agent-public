@@ -134,6 +134,30 @@ def test_confirm_records_uses_request_user_id_not_body(monkeypatch):
     assert resp.json()["inserted"] == 1
 
 
+def test_confirm_records_returns_400_when_daily_limit_exceeded(monkeypatch):
+    def fake_insert_records(user_id: str, items: list[dict]):
+        raise ValueError("2026-04-06 最多只能保存 10 条饮品记录")
+
+    monkeypatch.setattr(records_api, "insert_records", fake_insert_records)
+
+    payload = {
+        "items": [
+            {
+                "brand": "喜茶",
+                "name": "多肉葡萄",
+                "price": 19,
+                "source": "manual",
+                "consumed_at": "2026-04-06T12:00:00Z",
+            }
+        ],
+    }
+
+    resp = client.post("/bobo/records/confirm", json=payload, headers=_auth_header("real-user"))
+
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == "2026-04-06 最多只能保存 10 条饮品记录"
+
+
 def test_get_day_uses_request_user_id(monkeypatch):
     captured: dict[str, object] = {}
 
@@ -300,6 +324,7 @@ def test_get_stats_uses_request_user_id(monkeypatch):
 def test_insert_records_includes_user_id():
     cursor = _FakeCursor(
         responses=[
+            {"one": {"count": 0}},
             {
                 "one": {
                     "id": "r-1",
@@ -346,14 +371,16 @@ def test_insert_records_includes_user_id():
 
     assert rows[0]["user_id"] == "u-1"
     assert rows[0]["mood"] == "开心"
-    assert cursor.calls[0][1]["user_id"] == "u-1"
-    assert cursor.calls[0][1]["mood"] == "开心"
-    assert "INSERT INTO records" in cursor.calls[0][0]
+    assert "SELECT COUNT(*) AS count" in cursor.calls[0][0]
+    assert cursor.calls[1][1]["user_id"] == "u-1"
+    assert cursor.calls[1][1]["mood"] == "开心"
+    assert "INSERT INTO records" in cursor.calls[1][0]
 
 
 def test_insert_records_persists_photos_and_backfills_photo_url():
     cursor = _FakeCursor(
         responses=[
+            {"one": {"count": 0}},
             {
                 "one": {
                     "id": "r-9",
@@ -422,8 +449,56 @@ def test_insert_records_persists_photos_and_backfills_photo_url():
         "https://cdn.example.com/1.jpg",
         "https://cdn.example.com/2.jpg",
     ]
-    assert "INSERT INTO record_photos" in cursor.calls[1][0]
-    assert cursor.calls[1][1]["record_id"] == "r-9"
+    assert "INSERT INTO record_photos" in cursor.calls[2][0]
+    assert cursor.calls[2][1]["record_id"] == "r-9"
+
+
+def test_insert_records_rejects_when_daily_limit_would_be_exceeded():
+    cursor = _FakeCursor(
+        responses=[
+            {"one": {"count": 9}},
+        ]
+    )
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(db_module, "_pool", _FakePool(cursor))
+    try:
+        with pytest.raises(ValueError, match="最多只能保存 10 条饮品记录"):
+            db_module.insert_records(
+                "u-1",
+                [
+                    {
+                        "menu_id": None,
+                        "brand": "喜茶",
+                        "name": "多肉葡萄",
+                        "size": None,
+                        "sugar": "少糖",
+                        "ice": "少冰",
+                        "mood": None,
+                        "price": Decimal("19.00"),
+                        "source": "manual",
+                        "notes": None,
+                        "consumed_at": "2026-04-06T12:00:00Z",
+                    },
+                    {
+                        "menu_id": None,
+                        "brand": "霸王茶姬",
+                        "name": "伯牙绝弦",
+                        "size": None,
+                        "sugar": "正常",
+                        "ice": "少冰",
+                        "mood": None,
+                        "price": Decimal("18.00"),
+                        "source": "manual",
+                        "notes": None,
+                        "consumed_at": "2026-04-06T18:00:00Z",
+                    },
+                ],
+            )
+    finally:
+        monkeypatch.undo()
+
+    assert len(cursor.calls) == 1
+    assert "SELECT COUNT(*) AS count" in cursor.calls[0][0]
 
 
 def test_query_day_filters_by_user_id():
@@ -618,3 +693,35 @@ def test_query_stats_filters_by_user_id():
     assert result["total_count"] == 2
     assert result["brand_dist"][0]["brand"] == "喜茶"
     assert all(params and params[0] == "u-4" for _, params in cursor.calls)
+
+
+def test_query_stats_week_defaults_to_today_window():
+    cursor = _FakeCursor(
+        responses=[
+            {"one": {"total_amount": Decimal("58.00"), "total_count": 4}},
+            {"all": [{"brand": "一点点", "count": 2}]},
+            {"all": [{"week": "W14", "count": 4}]},
+            {"all": [{"sugar": "三分糖", "count": 2}]},
+            {"all": [{"ice": "少冰", "count": 4}]},
+            {"all": [{"day": date(2026, 4, 1), "count": 2}]},
+        ]
+    )
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(db_module, "_pool", _FakePool(cursor))
+    fixed_now = datetime(2026, 4, 4, 12, 0, 0)
+
+    class _FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed_now
+
+    monkeypatch.setattr(db_module, "datetime", _FixedDateTime)
+    try:
+        result = db_module.query_stats("u-9", "week", None)
+    finally:
+        monkeypatch.undo()
+
+    assert result["total_count"] == 4
+    stats_sql, params = cursor.calls[0]
+    assert "consumed_at >=" in stats_sql
+    assert list(params) == ["u-9", date(2026, 3, 30), date(2026, 4, 6)]

@@ -1,11 +1,15 @@
 import * as ImagePicker from 'expo-image-picker';
 
 import { boboApi } from '@/lib/api';
+import { compressBeforeUpload, type UploadCompressionProfile } from '@/lib/imageCompression';
 
 export type UploadablePhotoAsset = {
   uri: string;
   mimeType?: string | null;
   fileName?: string | null;
+  width?: number | null;
+  height?: number | null;
+  fileSize?: number | null;
 };
 
 export function buildManualPhotoFilename(asset: UploadablePhotoAsset) {
@@ -26,22 +30,56 @@ export function buildManualPhotoFilename(asset: UploadablePhotoAsset) {
   };
 }
 
-export async function uploadImageAsset(asset: UploadablePhotoAsset) {
-  const { filename, mimeType } = buildManualPhotoFilename(asset);
-  const upload = await boboApi.getUploadUrl(filename, mimeType);
-  const imageResponse = await fetch(asset.uri);
-  const blob = await imageResponse.blob();
-  const putResp = await fetch(upload.data.upload_url, {
-    method: 'PUT',
-    headers: { 'Content-Type': mimeType },
-    body: blob,
+export async function uploadImageAsset(
+  asset: UploadablePhotoAsset,
+  options: {
+    profile: UploadCompressionProfile;
+    sourceType: 'photo' | 'screenshot' | 'manual';
+    onStageChange?: (stage: 'compressing' | 'uploading') => void;
+  }
+) {
+  options.onStageChange?.('compressing');
+  const prepared = await compressBeforeUpload({
+    uri: asset.uri,
+    mimeType: asset.mimeType,
+    fileName: asset.fileName,
+    width: asset.width,
+    height: asset.height,
+    fileSize: asset.fileSize,
+    profile: options.profile,
   });
 
-  if (!putResp.ok) {
-    throw new Error(`upload failed (${putResp.status})`);
-  }
+  try {
+    const { filename, mimeType } = buildManualPhotoFilename({
+      uri: prepared.uri,
+      mimeType: prepared.mimeType,
+      fileName: prepared.fileName,
+    });
+    const upload = await boboApi.getUploadUrl({
+      filename,
+      contentType: mimeType,
+      fileSize: prepared.size,
+      width: prepared.width,
+      height: prepared.height,
+      sourceType: options.sourceType,
+    });
+    options.onStageChange?.('uploading');
+    const imageResponse = await fetch(prepared.uri);
+    const blob = await imageResponse.blob();
+    const putResp = await fetch(upload.data.upload_url, {
+      method: 'PUT',
+      headers: { 'Content-Type': mimeType },
+      body: blob,
+    });
 
-  return upload.data.file_url;
+    if (!putResp.ok) {
+      throw new Error(`upload failed (${putResp.status})`);
+    }
+
+    return upload.data.file_url;
+  } finally {
+    await prepared.cleanup?.();
+  }
 }
 
 export function mapPickerAssetToUploadable(asset: ImagePicker.ImagePickerAsset): UploadablePhotoAsset {
@@ -49,5 +87,8 @@ export function mapPickerAssetToUploadable(asset: ImagePicker.ImagePickerAsset):
     uri: asset.uri,
     mimeType: asset.mimeType,
     fileName: asset.fileName,
+    width: asset.width,
+    height: asset.height,
+    fileSize: asset.fileSize,
   };
 }

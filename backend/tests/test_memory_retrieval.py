@@ -158,3 +158,49 @@ def test_search_relevant_memories_falls_back_when_vector_empty(monkeypatch):
     results = retrieval.search_relevant_memories("u-1", query="果茶", scope="recommendation", top_k=1)
 
     assert [item["id"] for item in results] == ["m1"]
+
+
+def test_build_agent_prompt_context_applies_budget_and_deduplicates(monkeypatch):
+    monkeypatch.setenv("BOBO_MEMORY_PROMPT_MAX_CHARS", "120")
+    monkeypatch.setenv("BOBO_MEMORY_PROMPT_PROFILE_CHARS", "40")
+    monkeypatch.setenv("BOBO_MEMORY_PROMPT_THREAD_CHARS", "30")
+    monkeypatch.setenv("BOBO_MEMORY_PROMPT_MEMORIES_CHARS", "40")
+    monkeypatch.setenv("BOBO_MEMORY_PROMPT_PER_ITEM_CHARS", "18")
+
+    monkeypatch.setattr(
+        retrieval.repository,
+        "get_profile",
+        lambda user_id: {
+            "drink_preferences": {
+                "default_sugar": "少糖",
+                "default_ice": "去冰",
+                "preferred_brands": ["喜茶", "古茗", "霸王茶姬"],
+                "preferred_categories": ["果茶", "奶茶"],
+            },
+            "interaction_preferences": {"reply_style": "brief"},
+            "budget_preferences": {"soft_price_ceiling": 20, "price_sensitive": True},
+        },
+    )
+    monkeypatch.setattr(
+        retrieval,
+        "load_latest_thread_summary",
+        lambda user_id, thread_key: "最近在比较低糖果茶，最近在比较低糖果茶",
+    )
+    monkeypatch.setattr(
+        retrieval,
+        "search_relevant_memories",
+        lambda user_id, query, scope=None, top_k=None: [
+            {"content": "最近预算偏紧，推荐便宜一些"},
+            {"content": "最近预算偏紧，推荐便宜一些"},
+            {"content": "优先果茶，不要太甜"},
+        ],
+    )
+
+    bundle = retrieval.build_agent_prompt_context("u-1", "thread-1", [("user", "推荐便宜一点")], include_metadata=True)
+
+    assert bundle["diagnostics"]["char_count"] <= 120
+    assert bundle["diagnostics"]["truncated"] is True
+    rendered = bundle["rendered_text"]
+    assert rendered.count("最近预算偏紧") == 1
+    assert "回答风格：brief" in rendered
+    assert "当前会话摘要" in rendered

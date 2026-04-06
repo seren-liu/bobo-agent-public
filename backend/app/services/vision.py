@@ -136,12 +136,34 @@ class VisionService:
     def _log(self, event: str, **fields: Any) -> None:
         logger.info(json.dumps({"event": event, **fields}, ensure_ascii=False, default=str))
 
+    @staticmethod
+    def _manual_entry_fallback(
+        *,
+        source_type: Literal["photo", "screenshot"],
+        error: Literal["recognition_failed", "parse_error"],
+        message: str,
+    ) -> VisionResult:
+        return VisionResult(
+            items=[],
+            source_type=source_type,
+            order_time=None,
+            error=error,
+            degraded=True,
+            fallback_mode="manual_entry",
+            retryable=True,
+            message=message,
+        )
+
     def recognize(self, image_url: str, source_type: Literal["photo", "screenshot"], request_id: str | None = None) -> VisionResult:
         try:
             client = self._create_client()
         except Exception as exc:
             self._log("vision_recognize_client_error", request_id=request_id, source_type=source_type, error=str(exc))
-            return VisionResult(items=[], source_type=source_type, order_time=None, error="recognition_failed")
+            return self._manual_entry_fallback(
+                source_type=source_type,
+                error="recognition_failed",
+                message="图片识别暂时不可用，建议直接手动补录品牌、品名、糖冰和价格。",
+            )
 
         last_exc: Exception | None = None
         response = None
@@ -172,7 +194,11 @@ class VisionService:
                 strategy=response_strategy,
                 error=str(last_exc) if last_exc else "unknown",
             )
-            return VisionResult(items=[], source_type=source_type, order_time=None, error="recognition_failed")
+            return self._manual_entry_fallback(
+                source_type=source_type,
+                error="recognition_failed",
+                message="图片识别暂时失败，建议切换到手动补录；也可以稍后重新尝试识别。",
+            )
 
         raw_content = response.choices[0].message.content if response.choices else ""
         text = self._strip_code_fence(self._extract_text_content(raw_content))
@@ -189,7 +215,11 @@ class VisionService:
                 error=str(exc),
                 preview=text[:200],
             )
-            return VisionResult(items=[], source_type=source_type, order_time=None, error="parse_error")
+            return self._manual_entry_fallback(
+                source_type=source_type,
+                error="parse_error",
+                message="识别结果暂时无法解析，建议直接手动补录。",
+            )
 
         try:
             raw_items = parsed.get("items", [])
@@ -203,7 +233,11 @@ class VisionService:
                 strategy=response_strategy,
                 error=str(exc),
             )
-            return VisionResult(items=[], source_type=source_type, order_time=None, error="parse_error")
+            return self._manual_entry_fallback(
+                source_type=source_type,
+                error="parse_error",
+                message="识别结果字段不完整，建议直接手动补录。",
+            )
 
         order_time = parsed.get("order_time")
         order_time_parsed = None
@@ -217,7 +251,11 @@ class VisionService:
                     strategy=response_strategy,
                     error="invalid order_time type",
                 )
-                return VisionResult(items=[], source_type=source_type, order_time=None, error="parse_error")
+                return self._manual_entry_fallback(
+                    source_type=source_type,
+                    error="parse_error",
+                    message="识别结果时间字段异常，建议直接手动补录。",
+                )
             try:
                 order_time_parsed = datetime.fromisoformat(order_time.replace("Z", "+00:00"))
             except ValueError as exc:
@@ -229,13 +267,21 @@ class VisionService:
                     strategy=response_strategy,
                     error=str(exc),
                 )
-                return VisionResult(items=[], source_type=source_type, order_time=None, error="parse_error")
+                return self._manual_entry_fallback(
+                    source_type=source_type,
+                    error="parse_error",
+                    message="识别结果时间格式异常，建议直接手动补录。",
+                )
 
         result = VisionResult(
             items=self._normalize_items(parsed_items),
             source_type=source_type,
             order_time=order_time_parsed,
             error=None,
+            degraded=False,
+            fallback_mode=None,
+            retryable=None,
+            message=None,
         )
         self._log(
             "vision_recognize_success",

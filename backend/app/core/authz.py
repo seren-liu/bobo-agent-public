@@ -16,6 +16,8 @@ TOOL_CAPABILITY_MAP = {
     "record_drink": "records:write",
     "search_menu": "menu:search",
     "get_stats": "stats:read",
+    "get_recent_records": "stats:read",
+    "get_day": "stats:read",
     "get_calendar": "calendar:read",
     "update_menu": MENU_ADMIN_CAPABILITY,
 }

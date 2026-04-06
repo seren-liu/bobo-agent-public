@@ -302,11 +302,12 @@ def extract_rule_based_facts(messages: list[dict[str, Any]], thread_key: str) ->
 def extract_structured_facts(
     messages: list[dict[str, Any]],
     *,
+    user_id: str | None = None,
     thread_key: str,
     rule_facts: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     source_message = messages[-1] if messages else None
-    extracted = MemoryStructuredExtractorService().extract_facts(messages, rule_facts=rule_facts)
+    extracted = MemoryStructuredExtractorService(user_id=user_id).extract_facts(messages, rule_facts=rule_facts)
     facts: list[dict[str, Any]] = []
     for fact in extracted:
         facts.append(
@@ -327,6 +328,37 @@ def extract_structured_facts(
             )
         )
     return facts
+
+
+def _call_structured_extractor(
+    messages: list[dict[str, Any]],
+    *,
+    user_id: str,
+    thread_key: str,
+    rule_facts: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    try:
+        return extract_structured_facts(
+            messages,
+            user_id=user_id,
+            thread_key=thread_key,
+            rule_facts=rule_facts,
+        )
+    except TypeError:
+        # Test doubles may expose the older lightweight signature without user_id.
+        return extract_structured_facts(
+            messages,
+            thread_key=thread_key,
+            rule_facts=rule_facts,
+        )
+
+
+def _build_memory_vector_service(user_id: str) -> MemoryVectorService:
+    try:
+        return MemoryVectorService(user_id=user_id)
+    except TypeError:
+        # Test doubles may not accept constructor arguments.
+        return MemoryVectorService()
 
 
 def _needs_structured_extraction(content: str, message_facts: list[dict[str, Any]]) -> bool:
@@ -427,7 +459,12 @@ def build_extraction_result(user_id: str, thread_key: str) -> dict[str, Any]:
         rule_facts.extend(message_rule_facts)
         if _needs_structured_extraction(content, message_rule_facts):
             try:
-                message_structured_facts = extract_structured_facts([message], thread_key=thread_key, rule_facts=message_rule_facts)
+                message_structured_facts = _call_structured_extractor(
+                    [message],
+                    user_id=user_id,
+                    thread_key=thread_key,
+                    rule_facts=message_rule_facts,
+                )
             except Exception:
                 structured_error_count += 1
                 message_structured_facts = []
@@ -452,7 +489,7 @@ def persist_extraction_result(user_id: str, thread_key: str) -> dict[str, Any]:
 
     upserted: list[dict[str, Any]] = []
     if result.get("memory_upserts"):
-        vector_service = MemoryVectorService()
+        vector_service = _build_memory_vector_service(user_id)
         for candidate in result["memory_upserts"]:
             item = repository.upsert_memory_item_by_fact(
                 user_id=user_id,

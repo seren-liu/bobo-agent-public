@@ -56,6 +56,28 @@ def test_structured_extractor_falls_back_to_heuristics_when_llm_fails(monkeypatc
     assert facts[0]["normalized_fact"]["value"] == "霸王茶姬"
 
 
+def test_structured_extractor_normalizes_brand_aliases():
+    service = MemoryStructuredExtractorService(api_key="")
+
+    facts = service.extract_facts(
+        [{"role": "user", "content": "我常喝一点点，这阵子先别推荐一点点"}],
+        rule_facts=[],
+    )
+
+    assert any(
+        fact["route"] == "profile"
+        and fact["field_path"] == "drink_preferences.preferred_brands"
+        and fact["value"] == ["1点点"]
+        for fact in facts
+    )
+    assert any(
+        fact["route"] == "memory"
+        and fact["normalized_fact"]["kind"] == "brand_constraint"
+        and fact["normalized_fact"]["value"] == "1点点"
+        for fact in facts
+    )
+
+
 def test_structured_extractor_llm_calls_disable_thinking():
     captured: dict[str, object] = {}
 

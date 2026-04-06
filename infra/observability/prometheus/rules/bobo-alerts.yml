@@ -1,0 +1,103 @@
+groups:
+  - name: bobo-product-alerts
+    rules:
+      - alert: BoboAgentErrorRateHigh
+        expr: |
+          (
+            sum(rate(bobo_agent_chat_requests_total{outcome=~"error|runtime_error"}[10m]))
+            /
+            clamp_min(sum(rate(bobo_agent_chat_requests_total[10m])), 0.001)
+          ) > 0.2
+        for: 10m
+        labels:
+          severity: warning
+          service: bobo-agent
+        annotations:
+          summary: "Agent 错误率升高"
+          description: "过去 10 分钟 Agent chat 错误率超过 20%。先看 Grafana 的 Agent Chat / Agent Tool Calls，再到 Loki 按 request_id 查 backend 日志。"
+
+      - alert: BoboVisionFailureRateHigh
+        expr: |
+          (
+            sum(rate(bobo_vision_requests_total{outcome=~"recognition_failed|parse_error"}[15m]))
+            /
+            clamp_min(sum(rate(bobo_vision_requests_total[15m])), 0.001)
+          ) > 0.15
+        for: 15m
+        labels:
+          severity: warning
+          service: bobo-vision
+        annotations:
+          summary: "Vision 识别失败率异常"
+          description: "过去 15 分钟视觉识别失败率超过 15%。先看 Vision Recognition Outcome，再查 vision_recognize_* 日志。"
+
+      - alert: BoboVisionLowConfidenceSpike
+        expr: |
+          sum(increase(bobo_vision_low_confidence_items_total[30m])) > 20
+        for: 10m
+        labels:
+          severity: warning
+          service: bobo-vision
+        annotations:
+          summary: "Vision 低置信度结果异常增多"
+          description: "过去 30 分钟低置信度识别条目新增超过 20 个，说明识别质量可能在变差。"
+
+      - alert: BoboAgentFirstTokenSlow
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (rate(bobo_agent_chat_first_token_seconds_bucket[10m]))
+          ) > 3
+        for: 10m
+        labels:
+          severity: warning
+          service: bobo-agent
+        annotations:
+          summary: "Agent 首字时间过慢"
+          description: "过去 10 分钟 Agent 首字 p95 超过 3 秒。用户会明显感知到 AI 回复变慢。"
+
+      - alert: BoboMenuSearchNoResultsSpike
+        expr: |
+          sum(rate(bobo_menu_search_results_bucket{le="0"}[15m])) > 0.1
+        for: 15m
+        labels:
+          severity: warning
+          service: bobo-search
+        annotations:
+          summary: "菜单搜索 0 结果明显增多"
+          description: "最近 15 分钟 0 结果搜索显著增多。可能是 Qdrant、菜单数据或品牌过滤逻辑出现异常。"
+
+      - alert: BoboQdrantSearchSlow
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (rate(bobo_qdrant_search_duration_seconds_bucket[10m]))
+          ) > 1.5
+        for: 10m
+        labels:
+          severity: warning
+          service: bobo-search
+        annotations:
+          summary: "Qdrant 搜索变慢"
+          description: "过去 10 分钟 Qdrant 搜索 p95 超过 1.5 秒。菜单搜索和 Agent 推荐体验会明显受影响。"
+
+      - alert: BoboLLMCostDailyBudgetExceeded
+        expr: |
+          sum(increase(bobo_llm_cost_cny_total[24h])) > 1
+        for: 5m
+        labels:
+          severity: critical
+          service: bobo-llm
+        annotations:
+          summary: "LLM 日成本超预算"
+          description: "最近 24 小时累计 LLM 成本超过 1 元。请检查 Agent 请求量、prompt 长度和异常重试。"
+
+      - alert: BoboMetricsEndpointDown
+        expr: up{job="bobo-backend"} == 0
+        for: 5m
+        labels:
+          severity: critical
+          service: bobo-backend
+        annotations:
+          summary: "后端 metrics 抓取失败"
+          description: "Prometheus 无法抓取后端 /metrics。先确认 backend 容器、/metrics 路由和网络连通性。"

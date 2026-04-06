@@ -10,6 +10,7 @@ import { Ionicons } from '@expo/vector-icons';
 import { boboApi } from '@/lib/api';
 import { useAuthStore } from '@/stores/authStore';
 import { AppButton } from '@/components/AppButton';
+import { getLocalDayStamp } from '@/lib/dateTime';
 
 const DEV_LOGIN_ENABLED = process.env.EXPO_PUBLIC_ENABLE_DEV_LOGIN === 'true';
 
@@ -25,7 +26,7 @@ export default function CalendarScreen() {
   const insets = useSafeAreaInsets();
   const accessToken = useAuthStore((s) => s.accessToken);
   const setSession = useAuthStore((s) => s.setSession);
-  const [selectedDate, setSelectedDate] = useState(new Date().toISOString().slice(0, 10));
+  const [selectedDate, setSelectedDate] = useState(getLocalDayStamp());
   const [monthAnchor, setMonthAnchor] = useState(new Date());
   const [loginPending, setLoginPending] = useState(false);
   const [loginError, setLoginError] = useState<string | null>(null);

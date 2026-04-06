@@ -6,6 +6,9 @@ import os
 import re
 from typing import Any
 
+from app.core.brands import canonicalize_brand_names, known_brand_names
+from app.services.llm_budget import extract_usage_tokens, record_usage
+
 logger = logging.getLogger("bobo.memory.structured")
 
 STRUCTURED_EXTRACTION_PROMPT = (
@@ -69,18 +72,6 @@ _CATEGORY_MAP = {
     "咖啡": "coffee",
 }
 _CATEGORY_ALIASES = {value: value for value in _CATEGORY_MAP.values()} | {key: value for key, value in _CATEGORY_MAP.items()}
-_BRANDS = (
-    "喜茶",
-    "奈雪",
-    "霸王茶姬",
-    "茶百道",
-    "沪上阿姨",
-    "CoCo",
-    "一点点",
-    "蜜雪冰城",
-    "古茗",
-    "益禾堂",
-)
 _PREFERENCE_HINTS = ("喜欢", "偏好", "爱喝", "更爱", "常喝", "一般喝", "通常喝", "不错")
 _AVOID_HINTS = ("别推荐", "别推", "先别", "不要", "不想喝", "喝腻了", "排斥")
 _TRANSIENT_HINTS = ("最近", "这阵子", "近期", "暂时", "先")
@@ -95,10 +86,12 @@ class MemoryStructuredExtractorService:
         api_key: str | None = None,
         base_url: str | None = None,
         model: str | None = None,
+        user_id: str | None = None,
     ) -> None:
         self.api_key = api_key or os.getenv("DASHSCOPE_API_KEY", "") or os.getenv("QWEN_API_KEY", "") or os.getenv("OPENAI_API_KEY", "")
         self.base_url = base_url or os.getenv("DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
         self.model = model or os.getenv("MEMORY_EXTRACTION_MODEL", "") or os.getenv("QWEN_CHAT_MODEL", "qwen3-32b")
+        self.user_id = user_id
 
     def _create_client(self) -> Any:
         try:
@@ -159,8 +152,8 @@ class MemoryStructuredExtractorService:
             if value is None:
                 return []
             if isinstance(value, list):
-                return [str(item) for item in value if str(item).strip()]
-            return [str(value)]
+                return canonicalize_brand_names(str(item) for item in value if str(item).strip())
+            return canonicalize_brand_names([str(value)])
         if field_path == "budget_preferences.soft_price_ceiling" and isinstance(value, str):
             try:
                 number = float(value)
@@ -176,7 +169,7 @@ class MemoryStructuredExtractorService:
             return {"kind": "drink_preference" if field_path.startswith("drink_preferences.") else "interaction_preference" if field_path.startswith("interaction_preferences.") else "budget_preference", "field": field, "value": value}
 
         if route == "memory":
-            brands = [brand for brand in _BRANDS if brand in content]
+            brands = canonicalize_brand_names(brand for brand in known_brand_names() if brand in content)
             price = MemoryStructuredExtractorService._extract_price(content)
             if any(hint in content for hint in _AVOID_HINTS) and brands:
                 return {
@@ -257,6 +250,15 @@ class MemoryStructuredExtractorService:
                 if response_format is not None:
                     kwargs["response_format"] = response_format
                 response = client.chat.completions.create(**kwargs)
+                usage = extract_usage_tokens(response)
+                if usage:
+                    record_usage(
+                        user_id=self.user_id,
+                        model=self.model,
+                        input_tokens=usage[0],
+                        output_tokens=usage[1],
+                        usage_kind="memory_extraction",
+                    )
                 break
             except Exception as exc:
                 logger.warning(
@@ -298,7 +300,7 @@ class MemoryStructuredExtractorService:
             clauses = [clause.strip() for clause in _CLAUSE_SPLIT_PATTERN.split(content) if clause.strip()]
             for clause in clauses or [content]:
                 categories = [normalized for label, normalized in _CATEGORY_MAP.items() if label in clause]
-                brands = [brand for brand in _BRANDS if brand in clause]
+                brands = canonicalize_brand_names(brand for brand in known_brand_names() if brand in clause)
                 has_preference = any(hint in clause for hint in _PREFERENCE_HINTS)
                 has_avoidance = any(hint in clause for hint in _AVOID_HINTS)
                 has_transient = any(hint in clause for hint in _TRANSIENT_HINTS)

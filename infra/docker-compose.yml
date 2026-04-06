@@ -38,15 +38,15 @@ services:
       timeout: 3s
       retries: 10
 
-  backend:
-    image: bobo-backend:latest
+  backend_blue:
+    image: ${BACKEND_BLUE_IMAGE:-bobo-backend:blue}
     build:
       context: ../backend
       dockerfile: Dockerfile
     restart: unless-stopped
     env_file: ../.env
     ports:
-      - "127.0.0.1:${BACKEND_PORT:-8000}:8000"
+      - "127.0.0.1:${BACKEND_BLUE_PORT:-18001}:8000"
     depends_on:
       postgres:
         condition: service_healthy
@@ -56,6 +56,37 @@ services:
         condition: service_healthy
     volumes:
       - ../backend:/app
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/bobo/health', timeout=2).read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    security_opt:
+      - no-new-privileges:true
+
+  backend_green:
+    image: ${BACKEND_GREEN_IMAGE:-bobo-backend:green}
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file: ../.env
+    ports:
+      - "127.0.0.1:${BACKEND_GREEN_PORT:-18002}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ../backend:/app
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/bobo/health', timeout=2).read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
     security_opt:
       - no-new-privileges:true
 
@@ -67,12 +98,97 @@ services:
       - "443:443"
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf
+      - ./nginx/runtime/bobo-upstreams.conf:/etc/nginx/conf.d/bobo-upstreams.conf
       - /etc/letsencrypt:/etc/letsencrypt:ro
       - ../web/dist:/usr/share/nginx/html
     depends_on:
-      - backend
+      - backend_blue
+      - backend_green
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    restart: unless-stopped
+    profiles: ["observability"]
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=14d
+      - --web.enable-lifecycle
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./observability/prometheus/rules:/etc/prometheus/rules:ro
+      - prometheus_data:/prometheus
+    depends_on:
+      - backend_blue
+      - backend_green
+      - alertmanager
+
+  alertmanager:
+    image: prom/alertmanager:v0.28.1
+    restart: unless-stopped
+    profiles: ["observability"]
+    environment:
+      ALERT_SMTP_SMARTHOST: ${ALERT_SMTP_SMARTHOST:-smtp.example.com:587}
+      ALERT_SMTP_USERNAME: ${ALERT_SMTP_USERNAME:-}
+      ALERT_SMTP_PASSWORD: ${ALERT_SMTP_PASSWORD:-}
+      ALERT_EMAIL_FROM: ${ALERT_EMAIL_FROM:-bobo-alerts@example.com}
+      ALERT_EMAIL_TO: ${ALERT_EMAIL_TO:-you@example.com}
+    entrypoint: ["/bin/sh", "/etc/alertmanager/start.sh"]
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./observability/alertmanager/start.sh:/etc/alertmanager/start.sh:ro
+      - alertmanager_data:/alertmanager
+
+  loki:
+    image: grafana/loki:3.4.2
+    restart: unless-stopped
+    profiles: ["observability"]
+    command: -config.file=/etc/loki/config.yml
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./observability/loki/config.yml:/etc/loki/config.yml:ro
+      - loki_data:/loki
+
+  promtail:
+    image: grafana/promtail:3.4.2
+    restart: unless-stopped
+    profiles: ["observability"]
+    command: -config.file=/etc/promtail/config.yml
+    volumes:
+      - ./observability/promtail/config.yml:/etc/promtail/config.yml:ro
+      - /var/log:/var/log:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      - loki
+
+  grafana:
+    image: grafana/grafana:12.2.0
+    restart: unless-stopped
+    profiles: ["observability"]
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+      - loki
 
 volumes:
   postgres_data:
   qdrant_data:
   redis_data:
+  prometheus_data:
+  loki_data:
+  grafana_data:
+  alertmanager_data:

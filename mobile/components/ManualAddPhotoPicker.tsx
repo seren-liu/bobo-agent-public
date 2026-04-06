@@ -10,7 +10,10 @@ export type ManualPhotoDraft = {
   uri: string;
   mimeType: string;
   filename: string;
-  status: 'local' | 'uploading' | 'uploaded' | 'failed';
+  width?: number;
+  height?: number;
+  fileSize?: number;
+  status: 'local' | 'compressing' | 'uploading' | 'uploaded' | 'failed';
   fileUrl?: string;
 };
 
@@ -159,6 +162,8 @@ export function ManualAddPhotoPicker({
 
 function formatPhotoStatus(status: ManualPhotoDraft['status']) {
   switch (status) {
+    case 'compressing':
+      return '压缩中';
     case 'uploading':
       return '上传中';
     case 'uploaded':

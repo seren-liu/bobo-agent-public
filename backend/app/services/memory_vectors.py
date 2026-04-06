@@ -6,6 +6,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 
 from app.core.config import get_settings
+from app.services.embedding import EmbeddingService
 from app.services.qdrant import QdrantService
 
 logger = logging.getLogger("bobo.memory_vectors")
@@ -23,8 +24,11 @@ def _run_async(coro):
 
 
 class MemoryVectorService:
-    def __init__(self) -> None:
-        self._service = QdrantService(collection_name=get_settings().memory_collection_name)
+    def __init__(self, *, user_id: str | None = None) -> None:
+        self._service = QdrantService(
+            collection_name=get_settings().memory_collection_name,
+            embedding_service=EmbeddingService(usage_user_id=user_id),
+        )
 
     async def _aupsert_memory_item(self, item: dict[str, Any]) -> None:
         try:

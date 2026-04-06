@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 from typing import Any
 
 from app.memory import repository
 from app.memory.extraction import persist_extraction_result
 from app.memory.profile import refresh_profile_from_records
 from app.memory.summaries import refresh_thread_summary
+
+logger = logging.getLogger("bobo.memory.jobs")
 
 
 def enqueue_memory_job(user_id: str, job_type: str, payload: dict[str, Any], thread_key: str | None = None) -> dict[str, Any]:
@@ -52,3 +56,18 @@ def process_memory_jobs(limit: int = 10) -> list[dict[str, Any]]:
             failed_job["error_stage"] = "process_memory_jobs"
             processed.append(failed_job)
     return processed
+
+
+async def process_memory_jobs_async(limit: int = 10) -> list[dict[str, Any]]:
+    return await asyncio.to_thread(process_memory_jobs, limit)
+
+
+def schedule_memory_jobs(limit: int = 10) -> asyncio.Task[list[dict[str, Any]]]:
+    async def _runner() -> list[dict[str, Any]]:
+        try:
+            return await process_memory_jobs_async(limit)
+        except Exception as exc:  # pragma: no cover
+            logger.exception("memory background jobs failed: %s", exc)
+            return []
+
+    return asyncio.create_task(_runner())

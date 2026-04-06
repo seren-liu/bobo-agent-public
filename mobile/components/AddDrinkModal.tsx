@@ -4,6 +4,7 @@ import { useQueryClient } from '@tanstack/react-query';
 
 import { ManualAddForm } from '@/components/ManualAddForm';
 import { boboApi } from '@/lib/api';
+import { getFriendlyRecordSaveError } from '@/lib/errorMessages';
 
 export interface AddDrinkModalRef {
   open: (opts?: { consumedAt?: string }) => void;
@@ -45,18 +46,22 @@ export const AddDrinkModal = forwardRef<AddDrinkModalRef>((_, ref) => {
         <ManualAddForm
           consumedAt={consumedAt}
           onSubmit={async (values) => {
-            await boboApi.confirmRecords([
-              {
-                brand: values.brand,
-                name: values.name,
-                sugar: values.sugar,
-                ice: values.ice,
-                mood: values.mood,
-                price: values.price,
-                source: 'manual',
-                consumed_at: values.consumedAt,
-              },
-            ]);
+            try {
+              await boboApi.confirmRecords([
+                {
+                  brand: values.brand,
+                  name: values.name,
+                  sugar: values.sugar,
+                  ice: values.ice,
+                  mood: values.mood,
+                  price: values.price,
+                  source: 'manual',
+                  consumed_at: values.consumedAt,
+                },
+              ]);
+            } catch (error) {
+              throw new Error(getFriendlyRecordSaveError(error));
+            }
             queryClient.invalidateQueries({ queryKey: ['records', 'day'] });
             queryClient.invalidateQueries({ queryKey: ['records', 'calendar'] });
             queryClient.invalidateQueries({ queryKey: ['records', 'recent'] });

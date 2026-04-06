@@ -1,4 +1,4 @@
-import { useRef, useMemo } from 'react';
+import { useRef, useMemo, useState } from 'react';
 import {
   View,
   Text,
@@ -18,12 +18,14 @@ import { type Href, useRouter } from 'expo-router';
 
 import { boboApi } from '@/lib/api';
 import { mapPickerAssetToUploadable, uploadImageAsset } from '@/lib/uploads';
+import { getLocalDayStamp } from '@/lib/dateTime';
 import { useAuthStore } from '@/stores/authStore';
 import { RecentDrinkCard } from '@/components/RecentDrinkCard';
 import {
   RecognitionConfirmSheet,
   type RecognitionConfirmSheetRef,
 } from '@/components/RecognitionConfirmSheet';
+import { RecognitionProcessingOverlay } from '@/components/RecognitionProcessingOverlay';
 
 // ─── Week strip helpers ───────────────────────────────────────────────────────
 
@@ -85,8 +87,19 @@ export default function HomeScreen() {
   const logout = useAuthStore((s) => s.logout);
   const userId = useAuthStore((s) => s.userId);
   const nickname = useAuthStore((s) => s.nickname);
+  const [recognitionState, setRecognitionState] = useState<{
+    visible: boolean;
+    sourceType: 'photo' | 'screenshot';
+    stage: 'compressing' | 'uploading' | 'recognizing';
+    previewUri?: string | null;
+  }>({
+    visible: false,
+    sourceType: 'photo',
+    stage: 'compressing',
+    previewUri: null,
+  });
 
-  const todayStr = useMemo(() => new Date().toISOString().split('T')[0]!, []);
+  const todayStr = useMemo(() => getLocalDayStamp(), []);
   const weekDays = useMemo(getWeekDays, []);
 
   const todayQuery = useQuery({
@@ -110,7 +123,31 @@ export default function HomeScreen() {
     sourceType: 'photo' | 'screenshot'
   ) => {
     try {
-      const fileUrl = await uploadImageAsset(mapPickerAssetToUploadable(asset));
+      setRecognitionState({
+        visible: true,
+        sourceType,
+        stage: 'compressing',
+        previewUri: asset.uri,
+      });
+      const fileUrl = await uploadImageAsset(mapPickerAssetToUploadable(asset), {
+        profile: sourceType === 'photo' ? 'recognition-photo' : 'recognition-screenshot',
+        sourceType,
+        onStageChange: (stage) =>
+          setRecognitionState((prev) => ({
+            ...prev,
+            visible: true,
+            sourceType,
+            stage,
+            previewUri: asset.uri,
+          })),
+      });
+      setRecognitionState((prev) => ({
+        ...prev,
+        visible: true,
+        sourceType,
+        stage: 'recognizing',
+        previewUri: asset.uri,
+      }));
       const recognize = await boboApi.recognize(fileUrl, sourceType);
       if (recognize.data.error) {
         throw new Error(`识别失败：${recognize.data.error}`);
@@ -119,6 +156,7 @@ export default function HomeScreen() {
         throw new Error('未识别到可用饮品，请尝试更清晰图片');
       }
 
+      setRecognitionState((prev) => ({ ...prev, visible: false }));
       recognitionRef.current?.open({
         sourceType,
         fileUrl,
@@ -128,6 +166,7 @@ export default function HomeScreen() {
 
       queryClient.invalidateQueries({ queryKey: ['records', 'day'] });
     } catch (e) {
+      setRecognitionState((prev) => ({ ...prev, visible: false }));
       Alert.alert('识别失败', e instanceof Error ? e.message : '请稍后重试');
     }
   };
@@ -350,6 +389,12 @@ export default function HomeScreen() {
           </View>
         </View>
       </ScrollView>
+      <RecognitionProcessingOverlay
+        visible={recognitionState.visible}
+        sourceType={recognitionState.sourceType}
+        stage={recognitionState.stage}
+        previewUri={recognitionState.previewUri}
+      />
       <RecognitionConfirmSheet ref={recognitionRef} />
     </View>
   );

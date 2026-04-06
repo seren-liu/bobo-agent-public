@@ -55,6 +55,7 @@ class UserProfile(SQLModel):
 _pool: ConnectionPool | None = None
 _schema_ready = False
 _memory_schema_ready = False
+MAX_RECORDS_PER_DAY = 10
 
 
 def _ensure_records_user_schema() -> None:
@@ -214,6 +215,24 @@ def _ensure_memory_schema() -> None:
         cur.execute(
             "CREATE INDEX IF NOT EXISTS idx_memory_write_jobs_status_scheduled_at ON memory_write_jobs (status, scheduled_at ASC)"
         )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_daily_llm_usage (
+              user_id UUID NOT NULL REFERENCES user_profile(user_id) ON DELETE CASCADE,
+              usage_date DATE NOT NULL,
+              model VARCHAR(120) NOT NULL,
+              input_tokens BIGINT NOT NULL DEFAULT 0,
+              output_tokens BIGINT NOT NULL DEFAULT 0,
+              estimated_cost_cny NUMERIC(12,6) NOT NULL DEFAULT 0,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              PRIMARY KEY (user_id, usage_date, model)
+            )
+            """
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_user_daily_llm_usage_user_date ON user_daily_llm_usage (user_id, usage_date DESC)"
+        )
         conn.commit()
 
     _memory_schema_ready = True
@@ -278,6 +297,43 @@ def _with_photo_payload(item: dict[str, Any]) -> dict[str, Any]:
     payload["photos"] = _normalize_item_photos(item)
     payload["photo_url"] = payload["photos"][0]["url"] if payload["photos"] else None
     return payload
+
+
+def _resolve_consumed_datetime(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        normalized = value.replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(normalized)
+        return parsed
+    raise ValueError("invalid consumed_at")
+
+
+def _enforce_daily_record_limit(
+    cur: Any,
+    user_id: str,
+    items: list[dict[str, Any]],
+) -> None:
+    pending_by_day: dict[str, int] = {}
+    for item in items:
+        consumed_at = _resolve_consumed_datetime(item.get("consumed_at"))
+        day_stamp = consumed_at.date().isoformat()
+        pending_by_day[day_stamp] = pending_by_day.get(day_stamp, 0) + 1
+
+    for day_stamp, pending_count in pending_by_day.items():
+        cur.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM records
+            WHERE user_id = %s
+              AND DATE(consumed_at) = %s
+            """,
+            (user_id, day_stamp),
+        )
+        row = cur.fetchone() or {}
+        existing_count = int(row.get("count") or 0)
+        if existing_count + pending_count > MAX_RECORDS_PER_DAY:
+            raise ValueError(f"{day_stamp} 最多只能保存 {MAX_RECORDS_PER_DAY} 条饮品记录")
 
 
 def _attach_photos_to_records(records: list[dict[str, Any]], photo_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -358,6 +414,13 @@ def create_user(username: str, password_hash: str, nickname: str | None = None) 
 
 def insert_records(user_id: str, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     if not _pool:
+        pending_by_day: dict[str, int] = {}
+        for item in items:
+            consumed_at = _resolve_consumed_datetime(item.get("consumed_at"))
+            day_stamp = consumed_at.date().isoformat()
+            pending_by_day[day_stamp] = pending_by_day.get(day_stamp, 0) + 1
+            if pending_by_day[day_stamp] > MAX_RECORDS_PER_DAY:
+                raise ValueError(f"{day_stamp} 最多只能保存 {MAX_RECORDS_PER_DAY} 条饮品记录")
         now = datetime.utcnow()
         result: list[dict[str, Any]] = []
         for idx, item in enumerate(items, start=1):
@@ -403,6 +466,7 @@ def insert_records(user_id: str, items: list[dict[str, Any]]) -> list[dict[str, 
     inserted: list[dict[str, Any]] = []
     inserted_photos: list[dict[str, Any]] = []
     with _pool.connection() as conn, conn.cursor() as cur:
+        _enforce_daily_record_limit(cur, user_id, items)
         for item in items:
             payload = _with_photo_payload(item)
             payload["user_id"] = user_id
@@ -545,14 +609,21 @@ def query_stats(user_id: str, period: str, date_str: str | None) -> dict[str, An
 
     where = "user_id = %s"
     params: list[Any] = [user_id]
-    if period == "month" and date_str:
-        year, month = map(int, date_str[:7].split("-"))
+    today = datetime.now().date()
+    effective_date = date_str
+    if period == "month" and not effective_date:
+        effective_date = today.isoformat()
+    if period == "week" and not effective_date:
+        effective_date = today.isoformat()
+
+    if period == "month" and effective_date:
+        year, month = map(int, effective_date[:7].split("-"))
         start = date(year, month, 1)
         end = (start.replace(day=28) + timedelta(days=4)).replace(day=1)
         where = "user_id = %s AND consumed_at >= %s AND consumed_at < %s"
         params = [user_id, start, end]
-    elif period == "week" and date_str:
-        anchor_source = date_str[:10] if len(date_str) >= 10 else f"{date_str}-01"
+    elif period == "week" and effective_date:
+        anchor_source = effective_date[:10] if len(effective_date) >= 10 else f"{effective_date}-01"
         anchor = date.fromisoformat(anchor_source)
         start = anchor - timedelta(days=anchor.weekday())
         end = start + timedelta(days=7)

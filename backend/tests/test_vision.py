@@ -3,7 +3,7 @@ from datetime import datetime
 import pytest
 from pydantic import ValidationError
 
-from app.models.vision import DrinkItem, VisionResult
+from app.models.vision import DrinkItem, UploadURLRequest, VisionResult
 
 
 def test_drink_item_confidence_range():
@@ -35,6 +35,30 @@ def test_vision_models_forbid_extra_fields():
 
     with pytest.raises(ValidationError):
         VisionResult(items=[], source_type="photo", extra_key="nope")
+
+
+def test_upload_url_request_requires_metadata():
+    payload = UploadURLRequest(
+        filename="image.jpg",
+        content_type="image/jpeg",
+        file_size=123456,
+        width=1200,
+        height=1600,
+        source_type="manual",
+    )
+
+    assert payload.source_type == "manual"
+
+    with pytest.raises(ValidationError):
+        UploadURLRequest(
+            filename="image.jpg",
+            content_type="image/jpeg",
+            file_size=0,
+            width=0,
+            height=1200,
+            source_type="photo",
+        )
+
 from app.services.cos import COSService
 
 
@@ -49,23 +73,31 @@ class _FakeCOSClient:
 
 def test_cos_service_get_upload_url(monkeypatch):
     service = COSService()
-    service.bucket = "example-bucket-1250000000"
-    service.region = "example-region"
+    service.bucket = "bobo-1250000000"
+    service.region = "ap-shanghai"
     service.scheme = "https"
 
     fake = _FakeCOSClient()
     monkeypatch.setattr(service, "_create_client", lambda: fake)
     monkeypatch.setattr(service, "_build_key", lambda user_id, filename, content_type: "photos/u-1/2026-03/abc123.jpg")
 
-    result = service.get_upload_url(filename="order.jpg", content_type="image/jpeg", user_id="u-1")
+    result = service.get_upload_url(
+        filename="order.jpg",
+        content_type="image/jpeg",
+        user_id="u-1",
+        file_size=300_000,
+        width=1280,
+        height=720,
+        source_type="photo",
+    )
 
     assert result["upload_url"] == "https://upload.example.com/signed?sign=abc"
-    assert result["file_url"] == "https://example-bucket-1250000000.cos.example-region.myqcloud.com/photos/u-1/2026-03/abc123.jpg"
+    assert result["file_url"] == "https://bobo-1250000000.cos.ap-shanghai.myqcloud.com/photos/u-1/2026-03/abc123.jpg"
 
     assert len(fake.calls) == 1
     call = fake.calls[0]
     assert call["Method"] == "PUT"
-    assert call["Bucket"] == "example-bucket-1250000000"
+    assert call["Bucket"] == "bobo-1250000000"
     assert call["Key"] == "photos/u-1/2026-03/abc123.jpg"
     assert call["Expired"] == 300
     assert call["Params"] == {"ContentType": "image/jpeg"}
@@ -85,13 +117,47 @@ def test_cos_service_rejects_non_image_uploads():
     service = COSService()
 
     with pytest.raises(ValueError):
-        service.get_upload_url(filename="notes.txt", content_type="text/plain", user_id="u-1")
+        service.get_upload_url(
+            filename="notes.txt",
+            content_type="text/plain",
+            user_id="u-1",
+            file_size=10_000,
+            width=100,
+            height=100,
+            source_type="manual",
+        )
+
+
+def test_cos_service_rejects_large_uploads():
+    service = COSService()
+
+    with pytest.raises(ValueError, match="image_too_large"):
+        service.get_upload_url(
+            filename="large.png",
+            content_type="image/png",
+            user_id="u-1",
+            file_size=4 * 1024 * 1024,
+            width=1200,
+            height=1200,
+            source_type="screenshot",
+        )
+
+    with pytest.raises(ValueError, match="image_resolution_too_large"):
+        service.get_upload_url(
+            filename="huge.jpg",
+            content_type="image/jpeg",
+            user_id="u-1",
+            file_size=500_000,
+            width=5000,
+            height=3000,
+            source_type="photo",
+        )
 
 
 def test_cos_service_get_display_url_adds_signature_and_inline(monkeypatch):
     service = COSService()
-    service.bucket = "example-bucket-1250000000"
-    service.region = "example-region"
+    service.bucket = "bobo-1250000000"
+    service.region = "ap-shanghai"
     service.scheme = "https"
     service.read_url_expired = 1800
 
@@ -100,14 +166,14 @@ def test_cos_service_get_display_url_adds_signature_and_inline(monkeypatch):
     def _fake_presigned(file_url: str, expired: int = 600):
         captured["file_url"] = file_url
         captured["expired"] = expired
-        return "https://example-bucket-1250000000.cos.example-region.myqcloud.com/photos/u-1/a.jpg?q-sign-algorithm=sha1"
+        return "https://bobo-1250000000.cos.ap-shanghai.myqcloud.com/photos/u-1/a.jpg?q-sign-algorithm=sha1"
 
     monkeypatch.setattr(service, "get_presigned_read_url", _fake_presigned)
 
-    result = service.get_display_url("https://example-bucket-1250000000.cos.example-region.myqcloud.com/photos/u-1/a.jpg")
+    result = service.get_display_url("https://bobo-1250000000.cos.ap-shanghai.myqcloud.com/photos/u-1/a.jpg")
 
     assert captured == {
-        "file_url": "https://example-bucket-1250000000.cos.example-region.myqcloud.com/photos/u-1/a.jpg",
+        "file_url": "https://bobo-1250000000.cos.ap-shanghai.myqcloud.com/photos/u-1/a.jpg",
         "expired": 1800,
     }
     assert "q-sign-algorithm=sha1" in result
@@ -165,6 +231,10 @@ def test_vision_service_recognize_parse_error(monkeypatch):
 
     assert result.error == "parse_error"
     assert result.items == []
+    assert result.degraded is True
+    assert result.fallback_mode == "manual_entry"
+    assert result.retryable is True
+    assert result.message is not None
 
 
 def test_vision_service_recognize_failed(monkeypatch):
@@ -176,6 +246,10 @@ def test_vision_service_recognize_failed(monkeypatch):
 
     assert result.error == "recognition_failed"
     assert result.items == []
+    assert result.degraded is True
+    assert result.fallback_mode == "manual_entry"
+    assert result.retryable is True
+    assert result.message is not None
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -198,10 +272,16 @@ def _build_vision_test_client(user_id: str = "u-test") -> TestClient:
 def test_upload_url_api_uses_request_user_id(monkeypatch):
     client = _build_vision_test_client(user_id="u-abc")
 
-    def _fake_upload(filename: str, content_type: str, user_id: str):
+    def _fake_upload(filename: str, content_type: str, user_id: str, **kwargs):
         assert filename == "image.jpg"
         assert content_type == "image/jpeg"
         assert user_id == "u-abc"
+        assert kwargs == {
+            "file_size": 321000,
+            "width": 1200,
+            "height": 1600,
+            "source_type": "photo",
+        }
         return {
             "upload_url": "https://upload.example.com/signed",
             "file_url": "https://cdn.example.com/path/image.jpg",
@@ -209,7 +289,17 @@ def test_upload_url_api_uses_request_user_id(monkeypatch):
 
     monkeypatch.setattr(vision_api._cos_service, "get_upload_url", _fake_upload)
 
-    resp = client.post("/bobo/upload-url", json={"filename": "image.jpg", "content_type": "image/jpeg"})
+    resp = client.post(
+        "/bobo/upload-url",
+        json={
+            "filename": "image.jpg",
+            "content_type": "image/jpeg",
+            "file_size": 321000,
+            "width": 1200,
+            "height": 1600,
+            "source_type": "photo",
+        },
+    )
     assert resp.status_code == 200
     assert resp.json() == {
         "upload_url": "https://upload.example.com/signed",
@@ -220,14 +310,24 @@ def test_upload_url_api_uses_request_user_id(monkeypatch):
 def test_upload_url_api_rejects_non_image(monkeypatch):
     client = _build_vision_test_client(user_id="u-abc")
 
-    def _fake_upload(filename: str, content_type: str, user_id: str):
-        raise ValueError("only image uploads are supported")
+    def _fake_upload(filename: str, content_type: str, user_id: str, **kwargs):
+        raise ValueError("unsupported_image_type")
 
     monkeypatch.setattr(vision_api._cos_service, "get_upload_url", _fake_upload)
 
-    resp = client.post("/bobo/upload-url", json={"filename": "notes.txt", "content_type": "text/plain"})
+    resp = client.post(
+        "/bobo/upload-url",
+        json={
+            "filename": "notes.txt",
+            "content_type": "text/plain",
+            "file_size": 1200,
+            "width": 100,
+            "height": 100,
+            "source_type": "manual",
+        },
+    )
     assert resp.status_code == 400
-    assert resp.json()["detail"] == "only image uploads are supported"
+    assert resp.json()["detail"] == "unsupported_image_type"
 
 
 def test_recognize_api_returns_vision_result(monkeypatch):
@@ -251,4 +351,42 @@ def test_recognize_api_returns_vision_result(monkeypatch):
         "source_type": "photo",
         "order_time": None,
         "error": "parse_error",
+        "degraded": False,
+        "fallback_mode": None,
+        "retryable": None,
+        "message": None,
+    }
+
+
+def test_recognize_api_returns_manual_entry_fallback(monkeypatch):
+    client = _build_vision_test_client()
+
+    def _fake_recognize(image_url: str, source_type: str, request_id: str | None = None):
+        return VisionResult(
+            items=[],
+            source_type="photo",
+            order_time=None,
+            error="recognition_failed",
+            degraded=True,
+            fallback_mode="manual_entry",
+            retryable=True,
+            message="图片识别暂时失败，建议手动补录。",
+        )
+
+    monkeypatch.setattr(vision_api._vision_service, "recognize", _fake_recognize)
+
+    resp = client.post(
+        "/bobo/vision/recognize",
+        json={"image_url": "https://cdn.example.com/order.jpg", "source_type": "photo"},
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "items": [],
+        "source_type": "photo",
+        "order_time": None,
+        "error": "recognition_failed",
+        "degraded": True,
+        "fallback_mode": "manual_entry",
+        "retryable": True,
+        "message": "图片识别暂时失败，建议手动补录。",
     }

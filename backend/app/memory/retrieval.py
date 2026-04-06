@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+import os
+import re
 from typing import Any
 
 from app.core.config import get_settings
@@ -16,9 +18,126 @@ _CATEGORY_LABELS = {
     "coffee": "咖啡",
 }
 
+_DEFAULT_MEMORY_PROMPT_MAX_CHARS = 760
+_DEFAULT_MEMORY_PROMPT_MAX_ITEMS = 4
+_DEFAULT_MEMORY_PROMPT_PER_ITEM_CHARS = 180
+_DEFAULT_MEMORY_PROMPT_PROFILE_CHARS = 240
+_DEFAULT_MEMORY_PROMPT_THREAD_CHARS = 220
+_DEFAULT_MEMORY_PROMPT_MEMORIES_CHARS = 320
+
 
 def _humanize_category(value: str) -> str:
     return _CATEGORY_LABELS.get(value, value)
+
+
+def _budget_int(env_name: str, default: int) -> int:
+    raw = os.getenv(env_name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        return max(int(str(raw).strip()), 1)
+    except ValueError:
+        return default
+
+
+def _normalize_text(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text or "")).strip().lower()
+
+
+def _truncate_text(text: str, limit: int) -> str:
+    value = str(text or "")
+    if limit <= 0 or len(value) <= limit:
+        return value
+    if limit <= 1:
+        return value[:limit]
+    return value[: max(limit - 1, 0)] + "…"
+
+
+def _approx_token_count(text: str) -> int:
+    value = str(text or "")
+    return max((len(value) + 1) // 2, 0)
+
+
+def _dedupe_texts(texts: list[str]) -> list[str]:
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for text in texts:
+        normalized = _normalize_text(text)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(text)
+    return deduped
+
+
+def _budget_prompt_sections(
+    prompts: list[tuple[str, str]],
+    *,
+    total_char_budget: int,
+) -> tuple[list[tuple[str, str]], dict[str, Any]]:
+    sections: list[tuple[str, str, str]] = []
+    for role, content in prompts:
+        label = "other"
+        if content.startswith("用户长期画像（优先）：\n"):
+            label = "profile"
+        elif content.startswith("当前会话摘要：\n"):
+            label = "thread_summary"
+        elif content.startswith("相关长期记忆：\n"):
+            label = "memories"
+        sections.append((role, content, label))
+
+    section_caps = {
+        "profile": _budget_int("BOBO_MEMORY_PROMPT_PROFILE_CHARS", _DEFAULT_MEMORY_PROMPT_PROFILE_CHARS),
+        "thread_summary": _budget_int("BOBO_MEMORY_PROMPT_THREAD_CHARS", _DEFAULT_MEMORY_PROMPT_THREAD_CHARS),
+        "memories": _budget_int("BOBO_MEMORY_PROMPT_MEMORIES_CHARS", _DEFAULT_MEMORY_PROMPT_MEMORIES_CHARS),
+        "other": total_char_budget,
+    }
+    seen: set[str] = set()
+    output: list[tuple[str, str]] = []
+    used_chars = 0
+    truncated = False
+    dropped_sections: list[str] = []
+    section_usage: dict[str, int] = {"profile": 0, "thread_summary": 0, "memories": 0, "other": 0}
+
+    for role, content, label in sections:
+        normalized = _normalize_text(content)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+
+        remaining_total = total_char_budget - used_chars
+        if remaining_total <= 0:
+            truncated = True
+            dropped_sections.append(label)
+            continue
+
+        section_cap = section_caps.get(label, total_char_budget)
+        remaining_section = section_cap - section_usage.get(label, 0)
+        if remaining_section <= 0:
+            truncated = True
+            dropped_sections.append(label)
+            continue
+
+        limit = min(len(content), remaining_total, remaining_section)
+        clipped = _truncate_text(content, limit)
+        if clipped != content:
+            truncated = True
+        output.append((role, clipped))
+        used_chars += len(clipped)
+        section_usage[label] = section_usage.get(label, 0) + len(clipped)
+
+    rendered_text = "\n".join(content for _, content in output)
+    diagnostics = {
+        "prompt_count": len(output),
+        "char_count": len(rendered_text),
+        "estimated_tokens": _approx_token_count(rendered_text),
+        "total_char_budget": total_char_budget,
+        "section_usage": section_usage,
+        "truncated": truncated,
+        "dropped_sections": dropped_sections,
+        "unique_prompt_count": len(seen),
+    }
+    return output, diagnostics
 
 
 def _profile_context_blocks(profile: dict[str, Any]) -> list[str]:
@@ -67,7 +186,12 @@ def build_memory_context_blocks(user_id: str, thread_key: str, query: str) -> di
     profile = repository.get_profile(user_id)
     profile_blocks = _profile_context_blocks(profile)
     thread_summary = load_latest_thread_summary(user_id, thread_key)
-    memories = search_relevant_memories(user_id, query=query, scope="recommendation")
+    memories = search_relevant_memories(
+        user_id,
+        query=query,
+        scope="recommendation",
+        top_k=_budget_int("BOBO_MEMORY_PROMPT_MAX_ITEMS", _DEFAULT_MEMORY_PROMPT_MAX_ITEMS),
+    )
     return {
         "profile_blocks": profile_blocks,
         "profile_summary": "\n".join(profile_blocks),
@@ -98,6 +222,14 @@ def _matches_query(memory: dict[str, Any], query: str) -> int:
     return score
 
 
+def _build_memory_vector_service(user_id: str) -> MemoryVectorService:
+    try:
+        return MemoryVectorService(user_id=user_id)
+    except TypeError:
+        # Test doubles may not accept constructor arguments.
+        return MemoryVectorService()
+
+
 def search_relevant_memories(user_id: str, query: str, scope: str | None = None, top_k: int | None = None) -> list[dict[str, Any]]:
     items = repository.list_memories(user_id)
     now = datetime.now(UTC)
@@ -123,7 +255,7 @@ def search_relevant_memories(user_id: str, query: str, scope: str | None = None,
     chosen = filtered[:limit]
 
     if query.strip():
-        vector_hits = MemoryVectorService().search_memory_items(
+        vector_hits = _build_memory_vector_service(user_id).search_memory_items(
             user_id=user_id,
             query=query,
             scope=scope,
@@ -160,7 +292,13 @@ def load_memory_context(user_id: str, thread_key: str, query: str) -> dict[str, 
     return build_memory_context_blocks(user_id, thread_key, query)
 
 
-def build_agent_prompt_context(user_id: str, thread_key: str, recent_messages: list[Any]) -> list[tuple[str, str]]:
+def build_agent_prompt_context(
+    user_id: str,
+    thread_key: str,
+    recent_messages: list[Any],
+    *,
+    include_metadata: bool = False,
+) -> list[tuple[str, str]] | dict[str, Any]:
     latest_user_text = ""
     for message in reversed(recent_messages):
         if isinstance(message, tuple) and len(message) >= 2 and message[0] == "user":
@@ -178,6 +316,22 @@ def build_agent_prompt_context(user_id: str, thread_key: str, recent_messages: l
     if context["thread_summary"]:
         prompts.append(("system", f"当前会话摘要：\n{context['thread_summary']}"))
     if context["memories"]:
-        memory_lines = [f"- {item['content']}" for item in context["memories"]]
+        per_item_budget = _budget_int("BOBO_MEMORY_PROMPT_PER_ITEM_CHARS", _DEFAULT_MEMORY_PROMPT_PER_ITEM_CHARS)
+        memory_lines = [
+            f"- {_truncate_text(str(item.get('content') or ''), per_item_budget)}"
+            for item in context["memories"]
+        ]
+        memory_lines = _dedupe_texts(memory_lines)
         prompts.append(("system", "相关长期记忆：\n" + "\n".join(memory_lines)))
-    return prompts
+
+    budgeted_prompts, diagnostics = _budget_prompt_sections(
+        prompts,
+        total_char_budget=_budget_int("BOBO_MEMORY_PROMPT_MAX_CHARS", _DEFAULT_MEMORY_PROMPT_MAX_CHARS),
+    )
+    if include_metadata:
+        return {
+            "prompts": budgeted_prompts,
+            "diagnostics": diagnostics,
+            "rendered_text": "\n".join(content for _, content in budgeted_prompts),
+        }
+    return budgeted_prompts

@@ -9,6 +9,7 @@ import * as ImagePicker from 'expo-image-picker';
 import { ManualAddPhotoPicker, type ManualPhotoDraft } from '@/components/ManualAddPhotoPicker';
 import { ManualAddForm } from '@/components/ManualAddForm';
 import { boboApi } from '@/lib/api';
+import { getFriendlyRecordSaveError } from '@/lib/errorMessages';
 import { uploadImageAsset } from '@/lib/uploads';
 
 export default function ManualAddScreen() {
@@ -37,6 +38,9 @@ export default function ManualAddScreen() {
           uri: asset.uri,
           mimeType: asset.mimeType || 'image/jpeg',
           filename: asset.fileName || `manual-${Date.now()}.jpg`,
+          width: asset.width,
+          height: asset.height,
+          fileSize: asset.fileSize,
           status: 'local',
         });
       }
@@ -60,14 +64,24 @@ export default function ManualAddScreen() {
         continue;
       }
 
-      setPhotos((prev) => prev.map((item) => (item.id === photo.id ? { ...item, status: 'uploading' } : item)));
-
       try {
-        const fileUrl = await uploadImageAsset({
-          uri: photo.uri,
-          mimeType: photo.mimeType,
-          fileName: photo.filename,
-        });
+        const fileUrl = await uploadImageAsset(
+          {
+            uri: photo.uri,
+            mimeType: photo.mimeType,
+            fileName: photo.filename,
+            width: photo.width,
+            height: photo.height,
+            fileSize: photo.fileSize,
+          },
+          {
+            profile: 'manual-gallery',
+            sourceType: 'manual',
+            onStageChange: (stage) => {
+              setPhotos((prev) => prev.map((item) => (item.id === photo.id ? { ...item, status: stage } : item)));
+            },
+          }
+        );
         uploadedUrls.push(fileUrl);
         nextPhotos[index] = { ...photo, status: 'uploaded', fileUrl };
         setPhotos((prev) =>
@@ -110,11 +124,11 @@ export default function ManualAddScreen() {
             photos: uploadedUrls.map((url, index) => ({ url, sort_order: index })),
           },
         ]);
-      } catch {
-        if (uploadedUrls.length) {
-          throw new Error('图片已上传，但记录保存失败，请重试');
-        }
-        throw new Error('记录保存失败，请稍后重试');
+      } catch (error) {
+        const fallback = uploadedUrls.length
+          ? '图片已经上传好了，但记录保存失败了，请再试一次。'
+          : '记录保存失败，请稍后重试';
+        throw new Error(getFriendlyRecordSaveError(error, fallback));
       }
 
       queryClient.invalidateQueries({ queryKey: ['records', 'day'] });

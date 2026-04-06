@@ -5,6 +5,9 @@ import { useMutation, useQueryClient } from '@tanstack/react-query';
 
 import { boboApi, type ConfirmItem, type VisionItem } from '@/lib/api';
 import { AppButton } from '@/components/AppButton';
+import { DatePickerModal } from '@/components/DatePickerModal';
+import { buildLocalDateTimeForDay, getLocalDayStamp } from '@/lib/dateTime';
+import { getFriendlyRecordSaveError } from '@/lib/errorMessages';
 
 interface EditableVisionItem {
   id: string;
@@ -33,8 +36,9 @@ export const RecognitionConfirmSheet = forwardRef<RecognitionConfirmSheetRef>((_
   const queryClient = useQueryClient();
   const [sourceType, setSourceType] = useState<'photo' | 'screenshot'>('photo');
   const [fileUrl, setFileUrl] = useState<string>('');
-  const [orderTime, setOrderTime] = useState<string | null>(null);
   const [items, setItems] = useState<EditableVisionItem[]>([]);
+  const [selectedDay, setSelectedDay] = useState(getLocalDayStamp());
+  const [datePickerVisible, setDatePickerVisible] = useState(false);
 
   const snapPoints = useMemo(() => ['80%'], []);
 
@@ -42,7 +46,8 @@ export const RecognitionConfirmSheet = forwardRef<RecognitionConfirmSheetRef>((_
     open: ({ sourceType, fileUrl, orderTime, items }) => {
       setSourceType(sourceType);
       setFileUrl(fileUrl);
-      setOrderTime(orderTime ?? null);
+      void orderTime;
+      setSelectedDay(getLocalDayStamp());
       setItems(
         items.map((it, idx) => ({
           id: `${Date.now()}-${idx}`,
@@ -76,7 +81,7 @@ export const RecognitionConfirmSheet = forwardRef<RecognitionConfirmSheetRef>((_
           source: sourceType,
           photo_url: fileUrl,
           photos: [{ url: fileUrl, sort_order: 0 }],
-          consumed_at: orderTime ?? new Date().toISOString(),
+          consumed_at: buildLocalDateTimeForDay(selectedDay, 12, 0, 0),
         }));
 
       if (!selected.length) {
@@ -86,17 +91,19 @@ export const RecognitionConfirmSheet = forwardRef<RecognitionConfirmSheetRef>((_
       await boboApi.confirmRecords(selected);
     },
     onSuccess: () => {
-      const today = new Date().toISOString().slice(0, 10);
+      const today = getLocalDayStamp();
       queryClient.invalidateQueries({ queryKey: ['records', 'day'] });
       queryClient.invalidateQueries({ queryKey: ['records', 'calendar'] });
       queryClient.invalidateQueries({ queryKey: ['records', 'recent'] });
       queryClient.invalidateQueries({ queryKey: ['records', 'stats'] });
+      queryClient.invalidateQueries({ queryKey: ['records', 'day-detail'] });
       queryClient.invalidateQueries({ queryKey: ['records', 'day', today] });
+      queryClient.invalidateQueries({ queryKey: ['records', 'day-detail', today] });
       Alert.alert('识别已保存', '记录已写入你的饮品日历');
       sheetRef.current?.close();
     },
     onError: (error) => {
-      Alert.alert('保存失败', error instanceof Error ? error.message : '请稍后重试');
+      Alert.alert('保存失败', getFriendlyRecordSaveError(error));
     },
   });
 
@@ -113,6 +120,17 @@ export const RecognitionConfirmSheet = forwardRef<RecognitionConfirmSheetRef>((_
       <BottomSheetView style={styles.content}>
         <Text style={styles.title}>识别确认</Text>
         <Text style={styles.subtitle}>可编辑、取消勾选或删除单条后再批量保存</Text>
+
+        <Pressable
+          onPress={() => setDatePickerVisible(true)}
+          style={({ pressed }) => [styles.dateCard, pressed && styles.dateCardPressed]}
+        >
+          <View>
+            <Text style={styles.dateCardLabel}>记录日期</Text>
+            <Text style={styles.dateCardValue}>{formatSelectedDay(selectedDay)}</Text>
+          </View>
+          <Text style={styles.dateCardAction}>选择</Text>
+        </Pressable>
 
         <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.list}>
           {items.map((item) => (
@@ -195,12 +213,35 @@ export const RecognitionConfirmSheet = forwardRef<RecognitionConfirmSheetRef>((_
           loading={saveMutation.isPending}
           style={styles.submit}
         />
+
+        <DatePickerModal
+          visible={datePickerVisible}
+          value={selectedDay}
+          title="选择识别记录日期"
+          subtitle="默认是今天，识别出的饮品会一起保存到你选中的这一天。"
+          onClose={() => setDatePickerVisible(false)}
+          onConfirm={setSelectedDay}
+        />
       </BottomSheetView>
     </BottomSheet>
   );
 });
 
 RecognitionConfirmSheet.displayName = 'RecognitionConfirmSheet';
+
+function formatSelectedDay(dayStamp: string) {
+  const parsed = new Date(`${dayStamp}T12:00:00`);
+  if (Number.isNaN(parsed.getTime())) {
+    return '今天';
+  }
+
+  return new Intl.DateTimeFormat('zh-CN', {
+    year: 'numeric',
+    month: 'short',
+    day: 'numeric',
+    weekday: 'short',
+  }).format(parsed);
+}
 
 function Field({
   label,
@@ -233,6 +274,38 @@ const styles = StyleSheet.create({
   content: { flex: 1, paddingHorizontal: 16, paddingBottom: 18 },
   title: { fontSize: 20, fontWeight: '700', color: '#111827' },
   subtitle: { marginTop: 4, marginBottom: 10, fontSize: 12, color: '#6B7280' },
+  dateCard: {
+    marginBottom: 10,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: 'rgba(255,222,183,0.6)',
+    backgroundColor: '#FFF9EB',
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  dateCardPressed: {
+    opacity: 0.88,
+    transform: [{ scale: 0.99 }],
+  },
+  dateCardLabel: {
+    fontSize: 11,
+    color: '#A07152',
+    fontWeight: '700',
+    marginBottom: 4,
+  },
+  dateCardValue: {
+    fontSize: 15,
+    color: '#8B5E3C',
+    fontWeight: '700',
+  },
+  dateCardAction: {
+    fontSize: 12,
+    fontWeight: '800',
+    color: '#A07152',
+  },
   list: { gap: 10, paddingBottom: 10 },
   card: {
     borderRadius: 14,

@@ -150,6 +150,19 @@ export interface VisionResult {
   source_type: 'photo' | 'screenshot';
   order_time: string | null;
   error?: 'recognition_failed' | 'parse_error' | null;
+  degraded?: boolean;
+  fallback_mode?: 'manual_entry' | null;
+  retryable?: boolean | null;
+  message?: string | null;
+}
+
+export interface UploadUrlRequest {
+  filename: string;
+  contentType: string;
+  fileSize: number;
+  width: number;
+  height: number;
+  sourceType: 'photo' | 'screenshot' | 'manual';
 }
 
 export interface MenuSearchItem {
@@ -340,10 +353,14 @@ export const boboApi = {
   disableAgentMemory: (memoryId: string) =>
     api.post(`/bobo/agent/memories/${encodeURIComponent(memoryId)}/disable`),
 
-  getUploadUrl: (filename: string, contentType: string) =>
+  getUploadUrl: ({ filename, contentType, fileSize, width, height, sourceType }: UploadUrlRequest) =>
     api.post<{ upload_url: string; file_url: string }>('/bobo/upload-url', {
       filename,
       content_type: contentType,
+      file_size: fileSize,
+      width,
+      height,
+      source_type: sourceType,
     }),
 
   recognize: (imageUrl: string, sourceType: 'photo' | 'screenshot') =>

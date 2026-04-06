@@ -8,6 +8,19 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
+UPLOAD_LIMITS = {
+    "photo": {"max_bytes": 2 * 1024 * 1024, "max_pixels": 12_000_000},
+    "screenshot": {"max_bytes": 3 * 1024 * 1024, "max_pixels": 12_000_000},
+    "manual": {"max_bytes": int(1.5 * 1024 * 1024), "max_pixels": 12_000_000},
+}
+ALLOWED_IMAGE_TYPES = {
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+    "image/heic",
+    "image/heif",
+}
+
 
 class COSService:
     def __init__(self) -> None:
@@ -60,9 +73,44 @@ class COSService:
         query_keys = {key.lower() for key, _ in parse_qsl(urlsplit(file_url).query, keep_blank_values=True)}
         return "q-sign-algorithm" in query_keys
 
-    def get_upload_url(self, filename: str, content_type: str, user_id: str) -> dict[str, str]:
-        if not content_type.startswith("image/"):
-            raise ValueError("only image uploads are supported")
+    def validate_upload_request(
+        self,
+        *,
+        content_type: str,
+        file_size: int,
+        width: int,
+        height: int,
+        source_type: str,
+    ) -> None:
+        normalized_content_type = (content_type or "").lower()
+        if normalized_content_type not in ALLOWED_IMAGE_TYPES:
+            raise ValueError("unsupported_image_type")
+        if source_type not in UPLOAD_LIMITS:
+            raise ValueError("unsupported_source_type")
+        limits = UPLOAD_LIMITS[source_type]
+        if file_size > limits["max_bytes"]:
+            raise ValueError("image_too_large")
+        if width * height > limits["max_pixels"]:
+            raise ValueError("image_resolution_too_large")
+
+    def get_upload_url(
+        self,
+        filename: str,
+        content_type: str,
+        user_id: str,
+        *,
+        file_size: int,
+        width: int,
+        height: int,
+        source_type: str,
+    ) -> dict[str, str]:
+        self.validate_upload_request(
+            content_type=content_type,
+            file_size=file_size,
+            width=width,
+            height=height,
+            source_type=source_type,
+        )
         key = self._build_key(user_id=user_id, filename=filename, content_type=content_type)
         client = self._create_client()
         upload_url = client.get_presigned_url(

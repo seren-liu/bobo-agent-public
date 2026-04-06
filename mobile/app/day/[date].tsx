@@ -9,6 +9,7 @@ import * as Haptics from 'expo-haptics';
 import { DayDetailContent } from '@/components/DayDetailContent';
 import { FloatingToast } from '@/components/FloatingToast';
 import { boboApi, type DrinkRecord } from '@/lib/api';
+import { buildLocalDateTimeForDay, getLocalDayStamp } from '@/lib/dateTime';
 
 export default function DayDetailScreen() {
   const router = useRouter();
@@ -17,7 +18,7 @@ export default function DayDetailScreen() {
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const params = useLocalSearchParams<{ date?: string | string[] }>();
   const date = Array.isArray(params.date) ? params.date[0] : params.date;
-  const safeDate = date ?? new Date().toISOString().slice(0, 10);
+  const safeDate = date ?? getLocalDayStamp();
   const [toastMessage, setToastMessage] = useState('');
   const [toastVisible, setToastVisible] = useState(false);
 
@@ -53,7 +54,7 @@ export default function DayDetailScreen() {
   const openManualAdd = () => {
     router.push({
       pathname: '/manual-add',
-      params: { consumedAt: `${safeDate}T12:00:00Z` },
+      params: { consumedAt: buildLocalDateTimeForDay(safeDate, 12, 0, 0) },
     });
   };
 

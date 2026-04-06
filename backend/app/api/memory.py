@@ -126,7 +126,7 @@ def disable_agent_memory(memory_id: str, request: Request) -> dict[str, bool]:
         raise HTTPException(status_code=404, detail="memory not found")
     row = next((item for item in repository.list_memories(user_id, include_inactive=True) if str(item["id"]) == memory_id), None)
     if row:
-        MemoryVectorService().upsert_memory_item(row)
+        MemoryVectorService(user_id=user_id).upsert_memory_item(row)
     return {"ok": True}
 
 

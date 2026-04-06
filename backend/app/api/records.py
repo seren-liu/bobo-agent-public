@@ -11,6 +11,7 @@ from app.models.schemas import (
     RecentRecordsResponse,
     StatsResponse,
 )
+from app.observability import observe_record_delete, observe_records_confirm
 from app.services.cos import COSService
 
 router = APIRouter(prefix="/bobo/records", tags=["records"])
@@ -52,7 +53,11 @@ def _decorate_records(records: list[dict]) -> list[dict]:
 @router.post("/confirm", response_model=ConfirmRecordsResponse, status_code=201)
 def confirm_records(payload: ConfirmRecordsRequest, request: Request) -> ConfirmRecordsResponse:
     user_id = _require_user_id(request)
-    inserted = insert_records(user_id, [item.model_dump() for item in payload.items])
+    try:
+        inserted = insert_records(user_id, [item.model_dump() for item in payload.items])
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    observe_records_confirm(item_count=len(inserted))
     return ConfirmRecordsResponse(inserted=len(inserted), records=_decorate_records(inserted))
 
 
@@ -86,7 +91,9 @@ def get_recent(
 def remove_record(record_id: str, request: Request) -> Response:
     deleted = delete_record(_require_user_id(request), record_id)
     if not deleted:
+        observe_record_delete(outcome="not_found")
         raise HTTPException(status_code=404, detail="record not found")
+    observe_record_delete(outcome="deleted")
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 

@@ -44,8 +44,11 @@ prepare_backend_env() {
 
   # shellcheck disable=SC1091
   source .venv/bin/activate
-  pip install -q --upgrade pip
-  pip install -q -e ".[all]"
+  if ! python -m pip --version >/dev/null 2>&1; then
+    python -m ensurepip --upgrade
+  fi
+  python -m pip install -q --upgrade pip
+  python -m pip install -q -e ".[all]"
 
   if [[ ! -f "$LOCAL_ENV" ]]; then
     echo "[dev-local] Missing .env.local. Run: bash scripts/dev_local.sh init"

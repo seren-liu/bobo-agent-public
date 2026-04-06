@@ -56,9 +56,9 @@ def test_refresh_endpoint_rotates_tokens():
 
 def test_register_creates_account_and_returns_session(monkeypatch):
     def _fake_create_user(username: str, password_hash: str, nickname: str | None = None):
-        assert username == "user@example.com"
+        assert username == "seren@example.com"
         assert password_hash
-        assert nickname == "Test User"
+        assert nickname == "Seren"
         return {
             "user_id": "u-999",
             "username": username,
@@ -70,7 +70,7 @@ def test_register_creates_account_and_returns_session(monkeypatch):
 
     resp = client.post(
         "/bobo/auth/register",
-        json={"name": "Test User", "email": " user@example.com ", "password": "test123456"},
+        json={"name": "Seren", "email": " Seren@example.com ", "password": "seren123456"},
     )
 
     assert resp.status_code == 200
@@ -88,7 +88,7 @@ def test_register_rejects_duplicate_account(monkeypatch):
 
     resp = client.post(
         "/bobo/auth/register",
-        json={"name": "Test User", "email": "user@example.com", "password": "test123456"},
+        json={"name": "Seren", "email": "seren@example.com", "password": "seren123456"},
     )
 
     assert resp.status_code == 409

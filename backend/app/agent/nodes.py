@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import asyncio
+import logging
 from collections.abc import Awaitable
 from typing import Any
 
@@ -32,6 +34,10 @@ SYSTEM_PROMPT = (
     "优先使用工具获取事实（菜单检索、统计、日历、记录写入、菜单更新），"
     "输出简洁、明确、可执行。"
 )
+
+_runtime_cache: dict[str, Any] | None = None
+_runtime_lock = asyncio.Lock()
+logger = logging.getLogger("bobo.agent.nodes")
 
 
 def _current_identity(explicit_user_id: str | None = None) -> str:
@@ -119,28 +125,39 @@ def _build_tool_lookup(tools: list[BaseTool]) -> dict[str, BaseTool]:
 
 
 async def create_runtime() -> dict[str, Any]:
-    try:
-        from langchain_openai import ChatOpenAI
-    except Exception as exc:  # pragma: no cover
-        raise RuntimeError("langchain-openai is required for agent llm node") from exc
+    global _runtime_cache
+    if _runtime_cache is not None:
+        return _runtime_cache
 
-    api_key = os.getenv("QWEN_API_KEY") or os.getenv("DASHSCOPE_API_KEY") or os.getenv("OPENAI_API_KEY")
-    base_url = os.getenv("DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
-    model = os.getenv("QWEN_CHAT_MODEL", "qwen3-32b")
+    async with _runtime_lock:
+        if _runtime_cache is not None:
+            return _runtime_cache
 
-    llm = ChatOpenAI(
-        api_key=api_key,
-        base_url=base_url,
-        model=model,
-        temperature=0.2,
-        streaming=True,
-    )
-    tools = await get_mcp_tools()
-    return {
-        "llm": llm.bind_tools(tools),
-        "tools": tools,
-        "tool_lookup": _build_tool_lookup(tools),
-    }
+        try:
+            from langchain_openai import ChatOpenAI
+        except Exception as exc:  # pragma: no cover
+            raise RuntimeError("langchain-openai is required for agent llm node") from exc
+
+        api_key = os.getenv("QWEN_API_KEY") or os.getenv("DASHSCOPE_API_KEY") or os.getenv("OPENAI_API_KEY")
+        base_url = os.getenv("DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
+        model = os.getenv("QWEN_CHAT_MODEL", "qwen3-32b")
+
+        llm = ChatOpenAI(
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+            temperature=0.2,
+            streaming=True,
+            extra_body={"enable_thinking": False},
+        )
+        tools = await get_mcp_tools()
+        _runtime_cache = {
+            "llm": llm.bind_tools(tools),
+            "tools": tools,
+            "tool_lookup": _build_tool_lookup(tools),
+            "model": model,
+        }
+        return _runtime_cache
 
 
 async def llm_node(state: dict[str, Any], runtime: dict[str, Any]) -> dict[str, Any]:
@@ -161,7 +178,26 @@ async def llm_node(state: dict[str, Any], runtime: dict[str, Any]) -> dict[str, 
         user_id = _current_identity(state.get("user_id"))
     except PermissionError:
         user_id = ""
-    memory_messages = build_agent_prompt_context(user_id, thread_id, messages) if thread_id and user_id else []
+    memory_bundle: dict[str, Any] = {"prompts": [], "diagnostics": {}}
+    if thread_id and user_id:
+        memory_bundle = build_agent_prompt_context(user_id, thread_id, messages, include_metadata=True)
+    memory_messages = list(memory_bundle.get("prompts") or [])
+    diagnostics = dict(memory_bundle.get("diagnostics") or {})
+    if diagnostics:
+        logger.info(
+            json.dumps(
+                {
+                    "event": "agent_memory_context_budget",
+                    "thread_id": thread_id,
+                    "prompt_count": diagnostics.get("prompt_count"),
+                    "char_count": diagnostics.get("char_count"),
+                    "estimated_tokens": diagnostics.get("estimated_tokens"),
+                    "truncated": diagnostics.get("truncated"),
+                },
+                ensure_ascii=False,
+                default=str,
+            )
+        )
     prompt_messages = [base_messages[0], *memory_messages, *base_messages[1:]] if has_system or base_messages else base_messages
 
     response = await llm.ainvoke(prompt_messages)

@@ -6,6 +6,7 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from app.services.menu_ops import MenuActionError, get_menu_ops_service
+from app.observability import observe_menu_search
 from app.services.qdrant import QdrantService
 
 router = APIRouter(prefix="/bobo/menu", tags=["menu"])
@@ -75,6 +76,7 @@ async def search_menu(
 ) -> MenuSearchResponse:
     service = get_qdrant_service()
     results = await service.search(query=q, brand=brand, top_k=top_k)
+    observe_menu_search(source="api", brand_filter=bool(brand), outcome="success", result_count=len(results))
     return MenuSearchResponse(results=results)
 
 

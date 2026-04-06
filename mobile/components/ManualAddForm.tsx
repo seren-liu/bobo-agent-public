@@ -11,6 +11,9 @@ import {
 } from 'react-native';
 
 import { AppButton } from '@/components/AppButton';
+import { DatePickerModal } from '@/components/DatePickerModal';
+import { buildLocalDateTimeForDay, getCurrentLocalIsoString, getLocalDayStamp } from '@/lib/dateTime';
+import { getFriendlyRecordSaveError } from '@/lib/errorMessages';
 
 const SUGAR_OPTS = ['无糖', '少糖', '半糖', '正常'] as const;
 const ICE_OPTS = ['去冰', '少冰', '正常冰', '多冰'] as const;
@@ -45,13 +48,14 @@ export function ManualAddForm({
   const [ice, setIce] = useState<(typeof ICE_OPTS)[number]>('少冰');
   const [mood, setMood] = useState('');
   const [price, setPrice] = useState('');
-  const [consumedAt, setConsumedAt] = useState(consumedAtProp ?? new Date().toISOString());
+  const [selectedDay, setSelectedDay] = useState(getLocalDayStamp(consumedAtProp ?? getCurrentLocalIsoString()));
+  const [datePickerVisible, setDatePickerVisible] = useState(false);
 
   useEffect(() => {
-    setConsumedAt(consumedAtProp ?? new Date().toISOString());
+    setSelectedDay(getLocalDayStamp(consumedAtProp ?? getCurrentLocalIsoString()));
   }, [consumedAtProp]);
 
-  const consumedDateLabel = useMemo(() => formatDateChip(consumedAt), [consumedAt]);
+  const consumedDateLabel = useMemo(() => formatDateChip(selectedDay), [selectedDay]);
 
   const reset = () => {
     setBrand('');
@@ -60,7 +64,7 @@ export function ManualAddForm({
     setIce('少冰');
     setMood('');
     setPrice('');
-    setConsumedAt(consumedAtProp ?? new Date().toISOString());
+    setSelectedDay(getLocalDayStamp(consumedAtProp ?? getCurrentLocalIsoString()));
   };
 
   const handleSubmit = async () => {
@@ -79,7 +83,7 @@ export function ManualAddForm({
         ice,
         mood: mood.trim() || undefined,
         price: parseFloat(price) || 0,
-        consumedAt,
+        consumedAt: buildLocalDateTimeForDay(selectedDay, 12, 0, 0),
         reset,
       });
 
@@ -91,7 +95,7 @@ export function ManualAddForm({
         Alert.alert('保存成功', '这杯饮品已经写进你的记录里');
       }
     } catch (error) {
-      Alert.alert('保存失败', error instanceof Error ? error.message : '请检查网络连接后重试');
+      Alert.alert('保存失败', getFriendlyRecordSaveError(error, '请检查网络连接后重试'));
     }
   };
 
@@ -139,9 +143,13 @@ export function ManualAddForm({
 
           <View style={styles.doubleCol}>
             <FormField label="记录日期">
-              <View style={styles.readonlyInput}>
+              <Pressable
+                onPress={() => setDatePickerVisible(true)}
+                style={({ pressed }) => [styles.readonlyInput, pressed && styles.dateFieldPressed]}
+              >
                 <Text style={styles.readonlyValue}>{consumedDateLabel}</Text>
-              </View>
+                <Text style={styles.dateFieldAction}>选择</Text>
+              </Pressable>
             </FormField>
           </View>
         </View>
@@ -170,6 +178,15 @@ export function ManualAddForm({
           style={styles.submitBtn}
         />
       </View>
+
+      <DatePickerModal
+        visible={datePickerVisible}
+        value={selectedDay}
+        title="选择记录日期"
+        subtitle="默认是今天，点一下就可以改成任意一天。"
+        onClose={() => setDatePickerVisible(false)}
+        onConfirm={setSelectedDay}
+      />
     </View>
   );
 }
@@ -223,15 +240,17 @@ function OptionPicker<T extends string>({
   );
 }
 
-function formatDateChip(value: string) {
-  const parsed = new Date(value);
+function formatDateChip(dayStamp: string) {
+  const parsed = new Date(`${dayStamp}T12:00:00`);
   if (Number.isNaN(parsed.getTime())) {
     return '今天';
   }
 
   return parsed.toLocaleDateString('zh-CN', {
+    year: 'numeric',
     month: 'short',
     day: 'numeric',
+    weekday: 'short',
   });
 }
 
@@ -320,12 +339,23 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: 'rgba(255,222,183,0.6)',
     paddingHorizontal: 16,
-    justifyContent: 'center',
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  dateFieldPressed: {
+    opacity: 0.88,
+    transform: [{ scale: 0.99 }],
   },
   readonlyValue: {
     fontSize: 15,
     fontWeight: '600',
     color: '#8B5E3C',
+  },
+  dateFieldAction: {
+    fontSize: 12,
+    fontWeight: '800',
+    color: '#A07152',
   },
   submitSection: {
     marginTop: 2,

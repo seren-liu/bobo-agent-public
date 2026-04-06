@@ -1,0 +1,271 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "datasource": {
+        "type": "grafana",
+        "uid": "-- Grafana --"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "options": {
+        "content": "## Request Trace\n\n把 `request_id` 填进顶部变量，然后从下往上看：先看 `HTTP`，再看 `Agent`，最后看 `Tool / Vision / Menu & Records`。\n\n推荐顺序：\n1. 确认是否真的进了后端\n2. 看状态码和耗时\n3. 看 Agent 走到哪个 phase\n4. 看 tool / vision / menu / records 哪一步异常\n\n如果请求在灰度槽位，就把 `backend_service` 切到 `backend_green`。",
+        "mode": "markdown"
+      },
+      "title": "How To Use",
+      "type": "text"
+    },
+    {
+      "datasource": {
+        "type": "loki",
+        "uid": "loki"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 5
+      },
+      "id": 2,
+      "options": {
+        "showLabels": true,
+        "showTime": true,
+        "wrapLogMessage": true
+      },
+      "targets": [
+        {
+          "expr": "{compose_service=\"$backend_service\"} | json | request_id=\"$request_id\"",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ],
+      "title": "All Logs For Request",
+      "type": "logs"
+    },
+    {
+      "datasource": {
+        "type": "loki",
+        "uid": "loki"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 13
+      },
+      "id": 3,
+      "options": {
+        "showLabels": true,
+        "showTime": true,
+        "wrapLogMessage": true
+      },
+      "targets": [
+        {
+          "expr": "{compose_service=\"$backend_service\",event=~\"http_request|http_access\"} | json | request_id=\"$request_id\"",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ],
+      "title": "HTTP Layer",
+      "type": "logs"
+    },
+    {
+      "datasource": {
+        "type": "loki",
+        "uid": "loki"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 13
+      },
+      "id": 4,
+      "options": {
+        "showLabels": true,
+        "showTime": true,
+        "wrapLogMessage": true
+      },
+      "targets": [
+        {
+          "expr": "{compose_service=\"$backend_service\",event=\"agent_chat_phase\"} | json | request_id=\"$request_id\"",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ],
+      "title": "Agent Phases",
+      "type": "logs"
+    },
+    {
+      "datasource": {
+        "type": "loki",
+        "uid": "loki"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 21
+      },
+      "id": 5,
+      "options": {
+        "showLabels": true,
+        "showTime": true,
+        "wrapLogMessage": true
+      },
+      "targets": [
+        {
+          "expr": "{compose_service=\"$backend_service\",logger=\"bobo.audit\"} | json | request_id=\"$request_id\"",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ],
+      "title": "Tool And Audit",
+      "type": "logs"
+    },
+    {
+      "datasource": {
+        "type": "loki",
+        "uid": "loki"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 21
+      },
+      "id": 6,
+      "options": {
+        "showLabels": true,
+        "showTime": true,
+        "wrapLogMessage": true
+      },
+      "targets": [
+        {
+          "expr": "{compose_service=\"$backend_service\",logger=~\"bobo.vision.api|bobo.vision.service\"} | json | request_id=\"$request_id\"",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ],
+      "title": "Vision Trace",
+      "type": "logs"
+    },
+    {
+      "datasource": {
+        "type": "loki",
+        "uid": "loki"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 29
+      },
+      "id": 7,
+      "options": {
+        "showLabels": true,
+        "showTime": true,
+        "wrapLogMessage": true
+      },
+      "targets": [
+        {
+          "expr": "{compose_service=\"$backend_service\",logger=~\"bobo.qdrant|app.main|uvicorn.access\"} | json | request_id=\"$request_id\" | path=~\"/bobo/menu/search.*|/bobo/records.*\"",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ],
+      "title": "Menu And Records",
+      "type": "logs"
+    },
+    {
+      "datasource": {
+        "type": "grafana",
+        "uid": "-- Grafana --"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 29
+      },
+      "id": 8,
+      "options": {
+        "content": "### Explore Queries\n\n通用请求查询：\n```logql\n{compose_service=\"$backend_service\"} | json | request_id=\"$request_id\"\n```\n\n只看 Agent phase：\n```logql\n{compose_service=\"$backend_service\",event=\"agent_chat_phase\"} | json | request_id=\"$request_id\"\n```\n\n只看 tool / audit：\n```logql\n{compose_service=\"$backend_service\",logger=\"bobo.audit\"} | json | request_id=\"$request_id\"\n```\n\n只看 vision：\n```logql\n{compose_service=\"$backend_service\",logger=~\"bobo.vision.api|bobo.vision.service\"} | json | request_id=\"$request_id\"\n```",
+        "mode": "markdown"
+      },
+      "title": "Copyable Queries",
+      "type": "text"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 41,
+  "style": "dark",
+  "tags": [
+    "bobo",
+    "observability",
+    "request-id"
+  ],
+  "templating": {
+    "list": [
+      {
+        "current": {
+          "selected": false,
+          "text": "backend_blue",
+          "value": "backend_blue"
+        },
+        "hide": 0,
+        "label": "backend_service",
+        "name": "backend_service",
+        "options": [
+          {
+            "selected": true,
+            "text": "backend_blue",
+            "value": "backend_blue"
+          },
+          {
+            "selected": false,
+            "text": "backend_green",
+            "value": "backend_green"
+          }
+        ],
+        "query": "backend_blue,backend_green",
+        "type": "custom"
+      },
+      {
+        "current": {
+          "selected": false,
+          "text": "obs-trace-20260405-1",
+          "value": "obs-trace-20260405-1"
+        },
+        "hide": 0,
+        "label": "request_id",
+        "name": "request_id",
+        "options": [],
+        "query": "obs-trace-20260405-1",
+        "type": "textbox"
+      }
+    ]
+  },
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "",
+  "title": "Bobo Request Trace",
+  "uid": "bobo-request-trace",
+  "version": 1,
+  "weekStart": ""
+}

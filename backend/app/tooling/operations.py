@@ -1,9 +1,16 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import Any
 
+import psycopg
+from psycopg.rows import dict_row
+
+from app.core.brands import canonicalize_brand_name
+from app.core.config import get_settings
 from app.memory.profile import get_profile
-from app.models.db import insert_records, query_calendar, query_stats
+from app.models.db import insert_records, query_calendar, query_day, query_recent, query_stats
+from app.observability import observe_menu_search
 from app.services.menu_ops import MenuActionError, get_menu_ops_service
 from app.services.qdrant import QdrantService
 from app.tooling.context import audit_tool_event, resolve_tool_context
@@ -31,6 +38,7 @@ def record_drink_impl(
         source=source,
         required_user=True,
     )
+    brand = canonicalize_brand_name(brand) or brand
     ts = consumed_at or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     audit_tool_event(
         "record_drink",
@@ -76,6 +84,60 @@ def record_drink_impl(
     return payload
 
 
+def get_menu_brand_coverage_impl(*, brand: str | None = None, user_id: str | None = None, request_id: str | None = None, thread_id: str | None = None, source: str | None = None) -> bool | None:
+    context = resolve_tool_context(
+        user_id=user_id,
+        request_id=request_id,
+        thread_id=thread_id,
+        source=source,
+        required_user=False,
+    )
+    normalized_brand = canonicalize_brand_name(brand) if brand else None
+    if not normalized_brand:
+        return False
+
+    database_url = get_settings().database_url
+    if not database_url:
+        return None
+
+    audit_tool_event(
+        "menu_brand_coverage",
+        "start",
+        user_id=context.get("user_id"),
+        request_id=context.get("request_id"),
+        thread_id=context.get("thread_id"),
+        source=context.get("source"),
+        brand=normalized_brand,
+    )
+
+    try:
+        with psycopg.connect(database_url, row_factory=dict_row) as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT 1
+                FROM menu
+                WHERE brand = %s AND is_active = TRUE
+                LIMIT 1
+                """,
+                (normalized_brand,),
+            )
+            found = cur.fetchone() is not None
+    except Exception:
+        return None
+
+    audit_tool_event(
+        "menu_brand_coverage",
+        "success",
+        user_id=context.get("user_id"),
+        request_id=context.get("request_id"),
+        thread_id=context.get("thread_id"),
+        source=context.get("source"),
+        brand=normalized_brand,
+        covered=found,
+    )
+    return found
+
+
 async def search_menu_impl(
     *,
     query: str,
@@ -92,6 +154,7 @@ async def search_menu_impl(
         source=source,
         required_user=True,
     )
+    brand = canonicalize_brand_name(brand)
     audit_tool_event(
         "search_menu",
         "start",
@@ -105,6 +168,7 @@ async def search_menu_impl(
     service = QdrantService()
     results = await service.search(query=query, brand=brand, top_k=5)
     payload = {"results": results, "query": query, "brand": brand}
+    observe_menu_search(source=context["source"], brand_filter=bool(brand), outcome="success", result_count=len(results))
     audit_tool_event(
         "search_menu",
         "success",
@@ -151,6 +215,80 @@ def get_stats_impl(
         request_id=context["request_id"],
         thread_id=context["thread_id"],
         source=context["source"],
+    )
+    return payload
+
+
+def get_recent_records_impl(
+    *,
+    limit: int = 5,
+    user_id: str | None = None,
+    request_id: str | None = None,
+    thread_id: str | None = None,
+    source: str | None = None,
+) -> dict:
+    context = resolve_tool_context(
+        user_id=user_id,
+        request_id=request_id,
+        thread_id=thread_id,
+        source=source,
+        required_user=True,
+    )
+    audit_tool_event(
+        "get_recent_records",
+        "start",
+        user_id=context["user_id"],
+        request_id=context["request_id"],
+        thread_id=context["thread_id"],
+        source=context["source"],
+        limit=limit,
+    )
+    payload = {"records": query_recent(context["user_id"], limit)}
+    audit_tool_event(
+        "get_recent_records",
+        "success",
+        user_id=context["user_id"],
+        request_id=context["request_id"],
+        thread_id=context["thread_id"],
+        source=context["source"],
+        result_count=len(payload["records"]),
+    )
+    return payload
+
+
+def get_day_impl(
+    *,
+    date: str,
+    user_id: str | None = None,
+    request_id: str | None = None,
+    thread_id: str | None = None,
+    source: str | None = None,
+) -> dict:
+    context = resolve_tool_context(
+        user_id=user_id,
+        request_id=request_id,
+        thread_id=thread_id,
+        source=source,
+        required_user=True,
+    )
+    audit_tool_event(
+        "get_day",
+        "start",
+        user_id=context["user_id"],
+        request_id=context["request_id"],
+        thread_id=context["thread_id"],
+        source=context["source"],
+        date=date,
+    )
+    payload = query_day(context["user_id"], datetime.fromisoformat(date).date())
+    audit_tool_event(
+        "get_day",
+        "success",
+        user_id=context["user_id"],
+        request_id=context["request_id"],
+        thread_id=context["thread_id"],
+        source=context["source"],
+        record_count=len(payload.get("records") or []),
     )
     return payload
 

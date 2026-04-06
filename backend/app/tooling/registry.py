@@ -5,6 +5,8 @@ from typing import Any
 from app.core.authz import get_auth_context, has_capability
 from app.tooling.operations import (
     get_calendar_impl,
+    get_day_impl,
+    get_recent_records_impl,
     get_stats_impl,
     record_drink_impl,
     search_menu_impl,
@@ -28,6 +30,8 @@ TOOL_NAMES = [
     "record_drink",
     "search_menu",
     "get_stats",
+    "get_recent_records",
+    "get_day",
     "get_calendar",
     "update_menu",
 ]
@@ -131,6 +135,42 @@ def get_stats_tool(
     )
 
 
+@tool("get_recent_records")
+def get_recent_records_tool(
+    limit: int = 5,
+    user_id: str | None = None,
+    request_id: str | None = None,
+    thread_id: str | None = None,
+    source: str | None = None,
+) -> dict:
+    """查询最近饮品记录。"""
+    return get_recent_records_impl(
+        limit=limit,
+        user_id=user_id,
+        request_id=request_id,
+        thread_id=thread_id,
+        source=source,
+    )
+
+
+@tool("get_day")
+def get_day_tool(
+    date: str,
+    user_id: str | None = None,
+    request_id: str | None = None,
+    thread_id: str | None = None,
+    source: str | None = None,
+) -> dict:
+    """查询某一天的饮品记录。"""
+    return get_day_impl(
+        date=date,
+        user_id=user_id,
+        request_id=request_id,
+        thread_id=thread_id,
+        source=source,
+    )
+
+
 @tool("get_calendar")
 def get_calendar_tool(
     year: int,
@@ -172,7 +212,7 @@ async def update_menu_tool(
 
 
 def get_local_tools() -> list[BaseTool]:
-    return [record_drink_tool, search_menu_tool, get_stats_tool, get_calendar_tool, update_menu_tool]
+    return [record_drink_tool, search_menu_tool, get_stats_tool, get_recent_records_tool, get_day_tool, get_calendar_tool, update_menu_tool]
 
 
 def register_mcp_tools(mcp: Any) -> None:
@@ -238,6 +278,40 @@ def register_mcp_tools(mcp: Any) -> None:
         guard_capability("get_stats")
         return get_stats_impl(
             period=period,
+            date=date,
+            user_id=guard_actor(user_id),
+            request_id=request_id,
+            thread_id=thread_id,
+            source=source,
+        )
+
+    @mcp.tool(name="get_recent_records")
+    def mcp_get_recent_records(
+        limit: int = 5,
+        user_id: str | None = None,
+        request_id: str | None = None,
+        thread_id: str | None = None,
+        source: str | None = None,
+    ) -> dict:
+        guard_capability("get_recent_records")
+        return get_recent_records_impl(
+            limit=limit,
+            user_id=guard_actor(user_id),
+            request_id=request_id,
+            thread_id=thread_id,
+            source=source,
+        )
+
+    @mcp.tool(name="get_day")
+    def mcp_get_day(
+        date: str,
+        user_id: str | None = None,
+        request_id: str | None = None,
+        thread_id: str | None = None,
+        source: str | None = None,
+    ) -> dict:
+        guard_capability("get_day")
+        return get_day_impl(
             date=date,
             user_id=guard_actor(user_id),
             request_id=request_id,
