@@ -8,7 +8,7 @@ from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 from sqlmodel import SQLModel
 
-from app.core.config import get_settings
+from app.core.config import get_settings, to_psycopg_conninfo
 
 
 class Menu(SQLModel):
@@ -244,7 +244,11 @@ def init_pool() -> None:
     if not settings.database_url:
         return
     if _pool is None:
-        _pool = ConnectionPool(conninfo=settings.database_url, kwargs={"row_factory": dict_row}, open=True)
+        _pool = ConnectionPool(
+            conninfo=to_psycopg_conninfo(settings.database_url),
+            kwargs={"row_factory": dict_row},
+            open=True,
+        )
         _ensure_records_user_schema()
         _ensure_memory_schema()
 

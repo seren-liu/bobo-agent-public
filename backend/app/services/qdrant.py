@@ -15,7 +15,7 @@ import psycopg
 from psycopg.rows import dict_row
 
 from app.core.brands import canonicalize_brand_name
-from app.core.config import get_settings
+from app.core.config import get_settings, to_psycopg_conninfo
 from app.observability import observe_qdrant_search
 from app.services.embedding import EmbeddingService
 
@@ -230,6 +230,7 @@ class QdrantService:
             params.append(brand)
         sql += " ORDER BY brand, name LIMIT %s"
         params.append(limit)
+        database_url = to_psycopg_conninfo(database_url)
 
         try:
             with psycopg.connect(database_url, row_factory=dict_row) as conn, conn.cursor() as cur:

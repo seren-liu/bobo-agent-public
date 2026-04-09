@@ -19,7 +19,6 @@ with open("pyproject.toml", "rb") as f:
     project = tomllib.load(f)["project"]
 
 requirements = list(project.get("dependencies", []))
-requirements.extend(project.get("optional-dependencies", {}).get("all", []))
 print("\n".join(requirements))
 PY
 

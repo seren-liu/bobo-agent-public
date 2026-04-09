@@ -7,7 +7,7 @@ from typing import Any
 import psycopg
 from psycopg.rows import dict_row
 
-from app.core.config import get_settings
+from app.core.config import get_settings, to_psycopg_conninfo
 from app.services.qdrant import QdrantService
 
 
@@ -19,7 +19,7 @@ def _db_url() -> str:
     database_url = get_settings().database_url
     if not database_url:
         raise MenuActionError("database_url is not configured")
-    return database_url
+    return to_psycopg_conninfo(database_url)
 
 
 def _to_float(value: Decimal | float | int | None) -> float | None:

@@ -7,7 +7,7 @@ import psycopg
 from psycopg.rows import dict_row
 
 from app.core.brands import canonicalize_brand_name
-from app.core.config import get_settings
+from app.core.config import get_settings, to_psycopg_conninfo
 from app.memory.profile import get_profile
 from app.models.db import insert_records, query_calendar, query_day, query_recent, query_stats
 from app.observability import observe_menu_search
@@ -99,6 +99,7 @@ def get_menu_brand_coverage_impl(*, brand: str | None = None, user_id: str | Non
     database_url = get_settings().database_url
     if not database_url:
         return None
+    database_url = to_psycopg_conninfo(database_url)
 
     audit_tool_event(
         "menu_brand_coverage",

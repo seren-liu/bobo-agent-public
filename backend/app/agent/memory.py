@@ -1,3 +1,16 @@
+"""Agent 记忆与会话存储模块。
+
+本模块负责 Agent 侧的会话线程、消息、摘要、长期记忆和记忆写入任务管理。
+它既支持 PostgreSQL 持久化模式，也支持无数据库时的本地内存 fallback。
+
+核心能力:
+- 会话线程管理: 注册、查询、归档、清空线程
+- 消息与摘要持久化: 保存对话消息和滚动摘要
+- 用户画像管理: 读取、合并、更新 memory profile
+- 长期记忆管理: 检索、写入、禁用、删除 memory item
+- Prompt 上下文装配: 将画像、摘要、长期记忆与最近消息拼成模型输入
+"""
+
 from __future__ import annotations
 
 from collections.abc import Iterable
@@ -19,7 +32,11 @@ DEFAULT_SUMMARY_TRIGGER_COUNT = 20
 DEFAULT_RECENT_WINDOW = 8
 DEFAULT_SEMANTIC_TOP_K = 4
 
+# 标记数据库 schema 是否已完成初始化，避免重复建表
 _SCHEMA_READY = False
+
+# 本地内存 fallback 存储。
+# 当数据库连接池不可用时，Agent 仍可在单进程内完成最小功能闭环。
 _LOCAL_THREADS: dict[str, dict[str, Any]] = {}
 _LOCAL_THREADS_BY_KEY: dict[str, str] = {}
 _LOCAL_MESSAGES: dict[str, list[dict[str, Any]]] = {}
@@ -30,22 +47,34 @@ _LOCAL_JOBS: list[dict[str, Any]] = []
 
 
 def _pool():
+    """获取底层数据库连接池。
+
+    返回:
+        数据库连接池对象；如果当前未初始化数据库则返回 None。
+    """
     return getattr(db_module, "_pool", None)
 
 
 def _utc_now() -> datetime:
+    """获取当前 UTC 时间。"""
     return datetime.now(timezone.utc)
 
 
 def _iso_now() -> str:
+    """获取当前 UTC ISO 时间字符串。"""
     return _utc_now().isoformat().replace("+00:00", "Z")
 
 
 def _new_id(prefix: str = "local") -> str:
+    """生成本地 fallback 用的字符串 ID。"""
     return f"{prefix}-{uuid4().hex}"
 
 
 def reset_local_state() -> None:
+    """重置所有本地 fallback 状态。
+
+    主要用于测试场景，确保内存态线程、消息、摘要和记忆不会相互污染。
+    """
     _LOCAL_THREADS.clear()
     _LOCAL_THREADS_BY_KEY.clear()
     _LOCAL_MESSAGES.clear()
@@ -56,11 +85,17 @@ def reset_local_state() -> None:
 
 
 def _ensure_schema() -> None:
+    """确保 Agent memory 相关数据库表存在。
+
+    只有在数据库连接池可用且 schema 尚未初始化时才执行建表逻辑。
+    本地 fallback 模式下会直接跳过。
+    """
     global _SCHEMA_READY
     pool = _pool()
     if _SCHEMA_READY or pool is None:
         return
 
+    # 统一在首次访问时懒初始化 schema，减少本地开发启动前置依赖。
     with pool.connection() as conn, conn.cursor() as cur:
         cur.execute(
             """
@@ -187,6 +222,18 @@ def _ensure_schema() -> None:
 
 
 def resolve_thread_key(user_id: str, thread_id: str | None = None) -> str:
+    """规范化线程 key。
+
+    将外部传入的 thread_id 统一映射成 `user-<id>:session-<session>` 格式，
+    方便跨端和数据库层稳定定位会话。
+
+    参数:
+        user_id: 用户标识符。
+        thread_id: 外部传入的线程 ID，可为空。
+
+    返回:
+        规范化后的线程 key。
+    """
     clean = (thread_id or "").strip()
     if not clean:
         clean = f"session-{uuid4().hex[:12]}"
@@ -198,6 +245,10 @@ def resolve_thread_key(user_id: str, thread_id: str | None = None) -> str:
 
 
 def _thread_defaults(user_id: str, thread_key: str, title: str | None = None) -> dict[str, Any]:
+    """构造线程默认结构。
+
+    在本地 fallback 或数据库异常回退时，提供统一的线程数据形状。
+    """
     now = _iso_now()
     return {
         "id": _new_id("thread"),
@@ -216,6 +267,20 @@ def _thread_defaults(user_id: str, thread_key: str, title: str | None = None) ->
 
 
 def register_thread(user_id: str, thread_id: str | None = None, title: str | None = None) -> dict[str, Any]:
+    """注册线程，若已存在则返回现有线程。
+
+    行为分两种:
+    1. 数据库模式: upsert `agent_threads`
+    2. 本地模式: 在 `_LOCAL_THREADS` 中创建或复用线程
+
+    参数:
+        user_id: 用户标识符。
+        thread_id: 外部线程 ID。
+        title: 线程标题，可选。
+
+    返回:
+        线程记录字典。
+    """
     _ensure_schema()
     thread_key = resolve_thread_key(user_id, thread_id)
     pool = _pool()
@@ -225,6 +290,7 @@ def register_thread(user_id: str, thread_id: str | None = None, title: str | Non
             thread = _LOCAL_THREADS[existing_id]
             if title and not thread.get("title"):
                 thread["title"] = title
+            # 线程被再次访问时刷新更新时间，模拟数据库中的 updated_at 行为。
             thread["updated_at"] = _iso_now()
             return thread
         thread = _thread_defaults(user_id, thread_key, title=title)
@@ -253,6 +319,7 @@ def register_thread(user_id: str, thread_id: str | None = None, title: str | Non
 
 
 def list_threads(user_id: str) -> list[dict[str, Any]]:
+    """列出用户的所有线程，按更新时间倒序返回。"""
     _ensure_schema()
     pool = _pool()
     if pool is None:
@@ -272,6 +339,15 @@ def list_threads(user_id: str) -> list[dict[str, Any]]:
 
 
 def get_thread(user_id: str, thread_id: str) -> dict[str, Any] | None:
+    """获取单个线程记录。
+
+    参数:
+        user_id: 用户标识符。
+        thread_id: 线程 ID。
+
+    返回:
+        线程记录；若不存在或不属于该用户则返回 None。
+    """
     _ensure_schema()
     pool = _pool()
     if pool is None:
@@ -292,6 +368,16 @@ def get_thread(user_id: str, thread_id: str) -> dict[str, Any] | None:
 
 
 def list_thread_messages(user_id: str, thread_id: str, *, limit: int | None = None) -> list[dict[str, Any]]:
+    """列出线程消息，按创建时间正序返回。
+
+    参数:
+        user_id: 用户标识符。
+        thread_id: 线程 ID。
+        limit: 可选的返回条数上限。
+
+    返回:
+        消息列表。
+    """
     _ensure_schema()
     pool = _pool()
     if pool is None:
@@ -329,6 +415,25 @@ def persist_message(
     tool_call_id: str | None = None,
     source: str = "agent",
 ) -> dict[str, Any]:
+    """持久化单条线程消息，并同步线程统计字段。
+
+    对 user/assistant 消息会累计 `message_count`，
+    同时刷新 `last_user_message_at` 或 `last_agent_message_at`。
+
+    参数:
+        user_id: 用户标识符。
+        thread_id: 线程 ID。
+        role: 消息角色，如 user / assistant / tool。
+        content: 消息内容。
+        content_type: 内容类型，默认 text。
+        request_id: 请求 ID，可选。
+        tool_name: 工具名，可选。
+        tool_call_id: 工具调用 ID，可选。
+        source: 消息来源，默认 agent。
+
+    返回:
+        新写入的消息记录。
+    """
     _ensure_schema()
     thread = register_thread(user_id, thread_id)
     now = _iso_now()
@@ -348,6 +453,7 @@ def persist_message(
             "created_at": now,
         }
         _LOCAL_MESSAGES.setdefault(thread["id"], []).append(row)
+        # 只统计自然对话消息，不把 tool 等内部消息计入 message_count。
         if role in {"user", "assistant"}:
             thread["message_count"] = int(thread.get("message_count") or 0) + 1
         thread["updated_at"] = now
@@ -387,6 +493,10 @@ def persist_message(
 
 
 def archive_thread(user_id: str, thread_id: str) -> dict[str, Any] | None:
+    """归档线程。
+
+    归档后线程不会被删除，但状态会变为 archived，保留完整历史记录。
+    """
     _ensure_schema()
     pool = _pool()
     if pool is None:
@@ -413,6 +523,10 @@ def archive_thread(user_id: str, thread_id: str) -> dict[str, Any] | None:
 
 
 def clear_thread(user_id: str, thread_id: str) -> dict[str, Any] | None:
+    """清空线程的消息和摘要，但保留线程本身。
+
+    适用于“重开一局”场景，避免删除线程元数据。
+    """
     _ensure_schema()
     pool = _pool()
     if pool is None:
@@ -460,6 +574,20 @@ def persist_summary(
     covered_message_count: int = 0,
     token_estimate: int | None = None,
 ) -> dict[str, Any]:
+    """持久化线程摘要，并更新线程的最后摘要时间。
+
+    参数:
+        user_id: 用户标识符。
+        thread_id: 线程 ID。
+        summary_type: 摘要类型，如 rolling。
+        summary_text: 摘要正文。
+        open_slots: 尚未解决的问题或待确认槽位。
+        covered_message_count: 本摘要覆盖的消息条数。
+        token_estimate: 粗略 token 估算值。
+
+    返回:
+        摘要记录。
+    """
     _ensure_schema()
     thread = register_thread(user_id, thread_id)
     now = _iso_now()
@@ -505,6 +633,7 @@ def persist_summary(
 
 
 def list_thread_summaries(user_id: str, thread_id: str) -> list[dict[str, Any]]:
+    """列出线程摘要，按创建时间倒序返回。"""
     _ensure_schema()
     pool = _pool()
     if pool is None:
@@ -524,11 +653,20 @@ def list_thread_summaries(user_id: str, thread_id: str) -> list[dict[str, Any]]:
 
 
 def get_latest_summary(user_id: str, thread_id: str) -> dict[str, Any] | None:
+    """获取线程最新一条摘要。"""
     summaries = list_thread_summaries(user_id, thread_id)
     return summaries[0] if summaries else None
 
 
 def _extract_text(value: Any) -> str:
+    """从多种 message/content 结构中提取纯文本。
+
+    兼容:
+    - 直接字符串
+    - 带 `content` 字段的对象
+    - OpenAI 风格的 content block 列表
+    - LangChain/LangGraph 常见消息对象
+    """
     if value is None:
         return ""
     if isinstance(value, str):
@@ -551,12 +689,23 @@ def _extract_text(value: Any) -> str:
 
 
 def build_thread_summary(user_id: str, thread_id: str) -> dict[str, Any]:
+    """基于最近若干条消息构建滚动摘要。
+
+    这是一个轻量摘要器，不依赖 LLM，主要用于:
+    - 提取最近用户表达
+    - 提取最近助手回复
+    - 尝试识别仍待回答的问题
+
+    返回:
+        可直接传给 `persist_summary` 的摘要结构。
+    """
     messages = list_thread_messages(user_id, thread_id, limit=max(getattr(get_settings(), "memory_recent_message_window", DEFAULT_RECENT_WINDOW), DEFAULT_RECENT_WINDOW))
     user_bits = [msg["content"].strip() for msg in messages if msg.get("role") == "user" and msg.get("content")]
     assistant_bits = [msg["content"].strip() for msg in messages if msg.get("role") == "assistant" and msg.get("content")]
     open_slots: list[str] = []
     if user_bits:
         last_user = user_bits[-1]
+        # 用非常轻量的启发式判断“最后一句像不像仍未回答的问题”。
         if any(mark in last_user for mark in ("?", "吗", "么", "是否", "要不要")):
             open_slots.append(last_user[:80])
     if len(user_bits) > 1 and not open_slots:
@@ -571,6 +720,7 @@ def build_thread_summary(user_id: str, thread_id: str) -> dict[str, Any]:
         summary_parts.append("当前会话暂无足够上下文。")
 
     summary_text = "；".join(summary_parts)
+    # 粗略按中文 4 字符约 1 token 估算，足够用于预算和阈值判断。
     token_estimate = max(1, len(summary_text) // 4)
     return {
         "summary_type": "rolling",
@@ -582,6 +732,13 @@ def build_thread_summary(user_id: str, thread_id: str) -> dict[str, Any]:
 
 
 def should_refresh_thread_summary(user_id: str, thread_id: str) -> bool:
+    """判断线程是否需要刷新摘要。
+
+    刷新条件:
+    1. 线程存在
+    2. message_count 达到阈值
+    3. 最新摘要覆盖的消息数落后于当前消息数
+    """
     thread = get_thread(user_id, thread_id)
     if not thread:
         return False
@@ -602,6 +759,11 @@ def queue_memory_job(
     thread_id: str | None = None,
     scheduled_at: str | None = None,
 ) -> dict[str, Any]:
+    """入队一个异步记忆写入任务。
+
+    该任务通常由对话结束后的后台流程消费，用于摘要刷新、画像更新、
+    记忆抽取等非阻塞工作。
+    """
     _ensure_schema()
     pool = _pool()
     now = scheduled_at or _iso_now()
@@ -636,6 +798,7 @@ def queue_memory_job(
 
 
 def list_memory_jobs(user_id: str | None = None) -> list[dict[str, Any]]:
+    """列出 memory write jobs，可按用户过滤。"""
     _ensure_schema()
     pool = _pool()
     if pool is None:
@@ -665,6 +828,10 @@ def list_memory_jobs(user_id: str | None = None) -> list[dict[str, Any]]:
 
 
 def get_profile(user_id: str) -> dict[str, Any]:
+    """获取 Agent memory profile。
+
+    如果数据库中不存在该用户画像，会先写入一条默认记录。
+    """
     _ensure_schema()
     default_profile = {
         "profile_version": 1,
@@ -707,6 +874,11 @@ def get_profile(user_id: str) -> dict[str, Any]:
 
 
 def merge_profile_patch(existing: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
+    """合并画像补丁。
+
+    这里只做浅层 section merge，不做 `app.memory.profile` 那样的深度递归。
+    因为 Agent 侧 profile 结构比较固定，按 section 更新已足够覆盖当前需求。
+    """
     merged = dict(existing)
     for key in ("display_preferences", "drink_preferences", "interaction_preferences", "budget_preferences", "health_preferences"):
         if key in patch and patch[key] is not None:
@@ -720,6 +892,7 @@ def merge_profile_patch(existing: dict[str, Any], patch: dict[str, Any]) -> dict
 
 
 def patch_profile(user_id: str, patch: dict[str, Any]) -> dict[str, Any]:
+    """应用画像补丁并持久化。"""
     current = get_profile(user_id)
     merged = merge_profile_patch(current, patch)
     merged["memory_updated_at"] = _iso_now()
@@ -765,6 +938,7 @@ def patch_profile(user_id: str, patch: dict[str, Any]) -> dict[str, Any]:
 
 
 def reset_profile(user_id: str) -> dict[str, Any]:
+    """重置用户画像为默认空结构。"""
     pool = _pool()
     if pool is None:
         _LOCAL_PROFILES[user_id] = {
@@ -788,6 +962,7 @@ def reset_profile(user_id: str) -> dict[str, Any]:
 
 
 def _stringify_profile_value(value: Any) -> str:
+    """将画像值安全转成可展示文本。"""
     if value is None:
         return ""
     if isinstance(value, (str, int, float, bool, Decimal)):
@@ -796,6 +971,7 @@ def _stringify_profile_value(value: Any) -> str:
 
 
 def format_profile_summary(profile: dict[str, Any]) -> str:
+    """把结构化画像渲染成适合注入 prompt 的摘要文本。"""
     drink = profile.get("drink_preferences") or {}
     budget = profile.get("budget_preferences") or {}
     interaction = profile.get("interaction_preferences") or {}
@@ -828,6 +1004,7 @@ def format_profile_summary(profile: dict[str, Any]) -> str:
 
 
 def format_thread_summary(summary: dict[str, Any] | None, thread: dict[str, Any] | None = None) -> str:
+    """把线程摘要渲染成 prompt 文本。"""
     if not summary:
         return "暂无可用会话摘要。"
     blocks = [f"摘要: {summary.get('summary_text') or ''}".strip()]
@@ -841,6 +1018,7 @@ def format_thread_summary(summary: dict[str, Any] | None, thread: dict[str, Any]
 
 
 def format_memory_lines(memories: list[dict[str, Any]]) -> str:
+    """把长期记忆列表渲染成逐行文本。"""
     if not memories:
         return "暂无相关长期记忆。"
     lines = []
@@ -853,6 +1031,10 @@ def format_memory_lines(memories: list[dict[str, Any]]) -> str:
 
 
 def _latest_user_text(messages: Iterable[Any]) -> str:
+    """从消息序列中提取最后一条用户文本。
+
+    用于作为长期记忆检索 query 的第一候选。
+    """
     for message in reversed(list(messages)):
         role = getattr(message, "type", None) or getattr(message, "role", None)
         if isinstance(message, tuple) and message:
@@ -872,6 +1054,15 @@ def search_relevant_memories(
     scope: str | None = None,
     top_k: int | None = None,
 ) -> list[dict[str, Any]]:
+    """检索与当前 query 相关的长期记忆。
+
+    当前实现分两种模式:
+    1. 本地 fallback: 简单 token 包含匹配
+    2. 数据库模式: 用 ILIKE 在 content / normalized_fact 上做轻量检索
+
+    注意:
+        这里还不是向量化 memory retrieval，而是偏工程化的轻量检索实现。
+    """
     _ensure_schema()
     top_k = top_k or int(getattr(get_settings(), "memory_semantic_top_k", DEFAULT_SEMANTIC_TOP_K) or DEFAULT_SEMANTIC_TOP_K)
     pool = _pool()
@@ -894,6 +1085,7 @@ def search_relevant_memories(
         rows = sorted(rows, key=lambda row: (row.get("salience", 0.5), row.get("last_used_at") or "", row.get("created_at") or ""), reverse=True)
         selected = rows[:top_k]
         for memory in selected:
+            # 读取命中的记忆时回写 last_used_at，便于后续按“最近使用”参与排序。
             memory["last_used_at"] = _iso_now()
         return selected
 
@@ -935,6 +1127,7 @@ def list_memories(
     scope: str | None = None,
     status: str | None = None,
 ) -> list[dict[str, Any]]:
+    """列出用户的长期记忆，可按 scope / status 过滤。"""
     _ensure_schema()
     pool = _pool()
     if pool is None:
@@ -978,6 +1171,11 @@ def upsert_memory_item(
     salience: float = 0.5,
     expires_at: str | None = None,
 ) -> dict[str, Any]:
+    """写入一条长期记忆。
+
+    当前实现是 append-only 风格，虽然函数名叫 upsert，
+    但这里并不会按业务键去重更新，而是新建一条 memory item。
+    """
     _ensure_schema()
     pool = _pool()
     payload = {
@@ -1021,6 +1219,7 @@ def upsert_memory_item(
 
 
 def disable_memory_item(user_id: str, memory_id: str) -> dict[str, Any] | None:
+    """禁用一条长期记忆，但不物理删除。"""
     _ensure_schema()
     pool = _pool()
     if pool is None:
@@ -1048,6 +1247,7 @@ def disable_memory_item(user_id: str, memory_id: str) -> dict[str, Any] | None:
 
 
 def delete_memory_item(user_id: str, memory_id: str) -> dict[str, Any] | None:
+    """物理删除一条长期记忆。"""
     _ensure_schema()
     pool = _pool()
     if pool is None:
@@ -1064,6 +1264,11 @@ def delete_memory_item(user_id: str, memory_id: str) -> dict[str, Any] | None:
 
 
 def refresh_profile_from_records(user_id: str) -> dict[str, Any]:
+    """基于记录为画像补默认值。
+
+    当前实现比较保守，只在缺省时补入默认糖度和冰度，
+    更复杂的偏好推导交给其他 memory/profile 模块处理。
+    """
     profile = get_profile(user_id)
     drink_preferences = dict(profile.get("drink_preferences") or {})
     if not drink_preferences.get("default_sugar"):
@@ -1082,6 +1287,18 @@ def load_prompt_context(
     recent_window: int | None = None,
     semantic_top_k: int | None = None,
 ) -> list[Any]:
+    """装配注入给 Agent 的 prompt 上下文。
+
+    拼装顺序是:
+    1. 原始 system prompt
+    2. 用户画像摘要
+    3. 当前会话摘要
+    4. 相关长期记忆
+    5. 最近窗口内的非 system 历史消息
+
+    其中长期记忆检索的 query 优先取“最近一条用户消息”，
+    如果拿不到，再退化到线程摘要文本。
+    """
     thread = get_thread(user_id, thread_id)
     profile = get_profile(user_id)
     latest_summary = get_latest_summary(user_id, thread_id)
@@ -1091,6 +1308,8 @@ def load_prompt_context(
     query = _latest_user_text(recent_messages) or (latest_summary or {}).get("summary_text") or ""
     memories = search_relevant_memories(user_id, query=query, top_k=semantic_top_k)
 
+    # 先把 memory 相关上下文压成多个 system block，
+    # 这样对主模型来说边界更清晰，也方便后续独立调整每个 block 的格式。
     blocks = [system_prompt.strip()]
     blocks.append(f"用户画像:\n{format_profile_summary(profile)}")
     blocks.append(f"当前会话:\n{format_thread_summary(latest_summary, thread)}")
@@ -1101,8 +1320,8 @@ def load_prompt_context(
         role = getattr(message, "type", None) or getattr(message, "role", None)
         if isinstance(message, tuple):
             role = message[0]
+        # 避免把上游 system 消息重复注入，防止 system prompt 污染和指令冲突。
         if role == "system":
             continue
         prompt_messages.append(message)
     return prompt_messages
-

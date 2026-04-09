@@ -2,6 +2,12 @@ from functools import lru_cache
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+def to_psycopg_conninfo(database_url: str) -> str:
+    if database_url.startswith("postgresql+psycopg://"):
+        return database_url.replace("postgresql+psycopg://", "postgresql://", 1)
+    return database_url
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 

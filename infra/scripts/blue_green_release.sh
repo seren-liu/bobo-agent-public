@@ -50,20 +50,24 @@ LATEST_IMAGE="${TCR_REGISTRY}/${TCR_NAMESPACE}/${TCR_REPOSITORY}:latest"
 
 bash "$ROOT_DIR/infra/scripts/sync_source_to_remote.sh" "$SERVER_ALIAS"
 
-echo "[blue-green-release] build backend image -> $REMOTE_IMAGE"
-docker buildx build \
-  --platform "$TARGET_PLATFORM" \
-  --load \
-  -t "$REMOTE_IMAGE" \
-  -t "$LATEST_IMAGE" \
-  "$ROOT_DIR/backend"
+if [[ "${SKIP_BUILD_PUSH:-0}" == "1" ]]; then
+  echo "[blue-green-release] skip local build/push, reuse prebuilt image -> $REMOTE_IMAGE"
+else
+  echo "[blue-green-release] build backend image -> $REMOTE_IMAGE"
+  docker buildx build \
+    --platform "$TARGET_PLATFORM" \
+    --load \
+    -t "$REMOTE_IMAGE" \
+    -t "$LATEST_IMAGE" \
+    "$ROOT_DIR/backend"
 
-echo "[blue-green-release] docker login -> $TCR_REGISTRY"
-printf '%s' "$TCR_PASSWORD" | docker login "$TCR_REGISTRY" -u "$TCR_USERNAME" --password-stdin
+  echo "[blue-green-release] docker login -> $TCR_REGISTRY"
+  printf '%s' "$TCR_PASSWORD" | docker login "$TCR_REGISTRY" -u "$TCR_USERNAME" --password-stdin
 
-echo "[blue-green-release] push images"
-docker push "$REMOTE_IMAGE"
-docker push "$LATEST_IMAGE"
+  echo "[blue-green-release] push images"
+  docker push "$REMOTE_IMAGE"
+  docker push "$LATEST_IMAGE"
+fi
 
 echo "[blue-green-release] deploy target slot -> $TARGET_SLOT"
 ssh "${SSH_OPTS[@]}" "$SERVER_ALIAS" "

@@ -12,13 +12,43 @@ fi
 sudo apt update
 sudo apt install -y certbot
 
-# 若 nginx 占用 80，先停
-if docker ps --format '{{.Names}}' | grep -q '^infra-nginx-1$'; then
-  docker compose -f /opt/bobo/infra/docker-compose.yml stop nginx
-fi
+WWW_DOMAIN="www.${DOMAIN}"
+WEBROOT="/var/www/certbot"
+NGINX_DIR="/opt/bobo/infra/nginx"
+BOOTSTRAP_CONF="${NGINX_DIR}/nginx.bootstrap.conf"
+FINAL_CONF="${NGINX_DIR}/nginx.conf"
 
-sudo certbot certonly --standalone -d "$DOMAIN" --email "$EMAIL" --agree-tos --no-eff-email
+sudo mkdir -p "$WEBROOT"
+sudo chmod 755 "$WEBROOT"
+
+if [ -f "$BOOTSTRAP_CONF" ]; then
+  cp "$FINAL_CONF" "$FINAL_CONF.pre-cert"
+  cp "$BOOTSTRAP_CONF" "$FINAL_CONF"
+fi
 
 docker compose -f /opt/bobo/infra/docker-compose.yml up -d nginx
 
-echo "Certificate issued for $DOMAIN"
+sudo certbot certonly \
+  --webroot \
+  -w "$WEBROOT" \
+  -d "$DOMAIN" \
+  -d "$WWW_DOMAIN" \
+  --email "$EMAIL" \
+  --agree-tos \
+  --no-eff-email \
+  --non-interactive
+
+if [ -f "${FINAL_CONF}.pre-cert" ]; then
+  cp "${FINAL_CONF}.pre-cert" "$FINAL_CONF"
+  rm -f "${FINAL_CONF}.pre-cert"
+fi
+
+docker compose -f /opt/bobo/infra/docker-compose.yml up -d --force-recreate nginx
+
+sudo tee /etc/cron.d/bobo-certbot >/dev/null <<CRON
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+17 3 * * * root certbot renew --quiet --deploy-hook "docker compose -f /opt/bobo/infra/docker-compose.yml exec -T nginx nginx -s reload"
+CRON
+
+echo "Certificate issued for $DOMAIN and $WWW_DOMAIN"

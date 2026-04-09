@@ -167,16 +167,17 @@ def import_items(items: list[dict[str, Any]], upsert_key: str, dry_run: bool) ->
     import psycopg
     from psycopg.rows import dict_row
 
-    from app.core.config import get_settings
+    from app.core.config import get_settings, to_psycopg_conninfo
 
     settings = get_settings()
     if not settings.database_url:
         raise RuntimeError("DATABASE_URL is not configured")
+    database_url = to_psycopg_conninfo(settings.database_url)
 
     inserted = 0
     updated = 0
 
-    with psycopg.connect(settings.database_url, row_factory=dict_row) as conn, conn.cursor() as cur:
+    with psycopg.connect(database_url, row_factory=dict_row) as conn, conn.cursor() as cur:
         for item in items:
             existing = _lookup_existing(cur, item, upsert_key=upsert_key)
             if existing:

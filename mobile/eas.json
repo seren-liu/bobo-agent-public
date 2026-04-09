@@ -1,0 +1,22 @@
+{
+  "cli": {
+    "version": ">= 16.16.0",
+    "appVersionSource": "remote"
+  },
+  "build": {
+    "production": {
+      "env": {
+        "EXPO_PUBLIC_API_URL": "https://bobo-agent.com"
+      },
+      "ios": {
+        "distribution": "store",
+        "autoIncrement": true
+      }
+    }
+  },
+  "submit": {
+    "production": {
+      "ios": {}
+    }
+  }
+}

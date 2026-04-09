@@ -6,6 +6,7 @@ SERVER_ALIAS="${1:-tx-server}"
 REMOTE_ROOT="${DEPLOY_REMOTE_ROOT:-/opt/bobo}"
 DEPLOY_ARCHIVE="/tmp/bobo-deploy.tgz"
 TOP_LEVELS_FILE="/tmp/bobo-deploy-top-level.txt"
+SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30 -o ServerAliveCountMax=20)
 
 ROOT_DIR="$ROOT_DIR" python - <<'PY' >"$TOP_LEVELS_FILE"
 import os
@@ -38,9 +39,9 @@ for item in output.split(b"\0"):
         print(path, end="\0")
 PY
 )
-scp "$DEPLOY_ARCHIVE" "$TOP_LEVELS_FILE" "$SERVER_ALIAS:/tmp/"
+scp "${SSH_OPTS[@]}" "$DEPLOY_ARCHIVE" "$TOP_LEVELS_FILE" "$SERVER_ALIAS:/tmp/"
 
-ssh "$SERVER_ALIAS" "REMOTE_ROOT='$REMOTE_ROOT' bash -s" <<'REMOTE'
+ssh "${SSH_OPTS[@]}" "$SERVER_ALIAS" "REMOTE_ROOT='$REMOTE_ROOT' bash -s" <<'REMOTE'
 set -euo pipefail
 mkdir -p "$REMOTE_ROOT"
 while IFS= read -r path; do
