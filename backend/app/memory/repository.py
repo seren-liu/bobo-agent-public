@@ -109,7 +109,7 @@ def create_thread(user_id: str, thread_key: str, title: str | None = None) -> di
     sql = """
     INSERT INTO agent_threads (user_id, thread_key, title)
     VALUES (%s, %s, %s)
-    ON CONFLICT (thread_key) DO UPDATE SET
+    ON CONFLICT (user_id, thread_key) DO UPDATE SET
       title = COALESCE(EXCLUDED.title, agent_threads.title),
       updated_at = NOW()
     RETURNING id::text, user_id::text AS user_id, thread_key, title, status, message_count,
@@ -1014,14 +1014,15 @@ def enqueue_job(user_id: str, job_type: str, payload: dict[str, Any], thread_key
 
 
 def list_pending_jobs(limit: int = 20) -> list[dict[str, Any]]:
+    now = _utcnow()
     if not has_pool():
-        return [deepcopy(item) for item in _LOCAL_JOBS if item["status"] == "pending"][:limit]
+        return [deepcopy(item) for item in _LOCAL_JOBS if item["status"] == "pending" and item.get("scheduled_at", now) <= now][:limit]
 
     sql = """
     SELECT id::text, user_id::text AS user_id, thread_id::text AS thread_id, job_type, payload,
            status, attempt_count, last_error, scheduled_at, created_at, updated_at
     FROM memory_write_jobs
-    WHERE status = 'pending'
+    WHERE status = 'pending' AND scheduled_at <= NOW()
     ORDER BY scheduled_at ASC
     LIMIT %s
     """
@@ -1032,7 +1033,57 @@ def list_pending_jobs(limit: int = 20) -> list[dict[str, Any]]:
         return cur.fetchall()
 
 
-def mark_job_status(job_id: str, status: str, *, attempt_count: int | None = None, last_error: str | None = None) -> None:
+def claim_pending_jobs(limit: int = 20) -> list[dict[str, Any]]:
+    now = _utcnow()
+    if not has_pool():
+        claimed: list[dict[str, Any]] = []
+        for item in _LOCAL_JOBS:
+            if item["status"] != "pending" or item.get("scheduled_at", now) > now:
+                continue
+            item["status"] = "running"
+            item["attempt_count"] = int(item.get("attempt_count") or 0) + 1
+            item["updated_at"] = now
+            claimed.append(deepcopy(item))
+            if len(claimed) >= limit:
+                break
+        return claimed
+
+    sql = """
+    WITH picked AS (
+      SELECT id
+      FROM memory_write_jobs
+      WHERE status = 'pending' AND scheduled_at <= NOW()
+      ORDER BY scheduled_at ASC
+      LIMIT %s
+      FOR UPDATE SKIP LOCKED
+    )
+    UPDATE memory_write_jobs jobs
+    SET status = 'running',
+        attempt_count = jobs.attempt_count + 1,
+        updated_at = NOW()
+    FROM picked
+    WHERE jobs.id = picked.id
+    RETURNING jobs.id::text, jobs.user_id::text AS user_id, jobs.thread_id::text AS thread_id,
+              jobs.job_type, jobs.payload, jobs.status, jobs.attempt_count, jobs.last_error,
+              jobs.scheduled_at, jobs.created_at, jobs.updated_at
+    """
+    pool = get_pool()
+    assert pool is not None
+    with pool.connection() as conn, conn.cursor() as cur:
+        cur.execute(sql, (limit,))
+        rows = cur.fetchall()
+        conn.commit()
+    return rows
+
+
+def mark_job_status(
+    job_id: str,
+    status: str,
+    *,
+    attempt_count: int | None = None,
+    last_error: str | None = None,
+    scheduled_at: datetime | None = None,
+) -> None:
     if not has_pool():
         for item in _LOCAL_JOBS:
             if item["id"] == job_id:
@@ -1041,6 +1092,8 @@ def mark_job_status(job_id: str, status: str, *, attempt_count: int | None = Non
                 if attempt_count is not None:
                     item["attempt_count"] = attempt_count
                 item["last_error"] = last_error
+                if scheduled_at is not None:
+                    item["scheduled_at"] = scheduled_at
                 break
         return
 
@@ -1053,12 +1106,26 @@ def mark_job_status(job_id: str, status: str, *, attempt_count: int | None = Non
             SET status = %s,
                 attempt_count = COALESCE(%s, attempt_count),
                 last_error = %s,
+                scheduled_at = COALESCE(%s, scheduled_at),
                 updated_at = NOW()
             WHERE id = %s::uuid
             """,
-            (status, attempt_count, last_error, job_id),
+            (status, attempt_count, last_error, scheduled_at, job_id),
         )
         conn.commit()
+
+
+def count_pending_jobs() -> int:
+    now = _utcnow()
+    if not has_pool():
+        return sum(1 for item in _LOCAL_JOBS if item["status"] == "pending" and item.get("scheduled_at", now) <= now)
+
+    pool = get_pool()
+    assert pool is not None
+    with pool.connection() as conn, conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM memory_write_jobs WHERE status = 'pending' AND scheduled_at <= NOW()")
+        row = cur.fetchone()
+    return int((row or [0])[0] or 0)
 
 
 def derive_profile_candidates_from_stats(user_id: str) -> dict[str, Any]:

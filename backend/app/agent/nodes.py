@@ -16,9 +16,11 @@ import logging
 from collections.abc import Awaitable
 from typing import Any
 
+from app.agent.prompting import build_prompt_bundle
 from app.agent.state import get_agent_context, resolve_agent_user_id
-from app.core.config import get_settings
-from app.memory.retrieval import build_agent_prompt_context
+from app.core.config import get_settings, is_production_env
+from app.core.resilience import DependencyError, call_with_resilience, get_circuit_breaker
+from app.core.tool_errors import build_tool_error_payload
 from app.tooling import (
     get_calendar_impl as _get_calendar_impl,
     get_local_tools,
@@ -28,6 +30,7 @@ from app.tooling import (
     update_menu_impl as _update_menu_impl,
 )
 from app.tooling.context import audit_tool_event
+from app.tooling.validation import validate_tool_args, validate_tool_result
 
 try:
     from langchain_core.messages import AIMessage, ToolMessage
@@ -37,12 +40,6 @@ except Exception:  # pragma: no cover
     ToolMessage = Any
     BaseTool = Any
 
-
-SYSTEM_PROMPT = (
-    "你是 Bobo 奶茶智能助手。"
-    "优先使用工具获取事实（菜单检索、统计、日历、记录写入、菜单更新），"
-    "输出简洁、明确、可执行。"
-)
 
 _runtime_cache: dict[str, Any] | None = None
 _runtime_lock = asyncio.Lock()
@@ -78,7 +75,11 @@ def _agent_tool_mode() -> str:
 def _mcp_service_token() -> str:
     """获取 MCP 服务级调用 token。"""
     settings = get_settings()
-    return settings.mcp_service_token or f"{settings.jwt_secret}:mcp"
+    if settings.mcp_service_token:
+        return settings.mcp_service_token
+    if not is_production_env(settings.env):
+        return f"{settings.jwt_secret}:mcp"
+    raise RuntimeError("MCP_SERVICE_TOKEN must be configured in production")
 
 
 def _mcp_headers() -> dict[str, str]:
@@ -110,6 +111,31 @@ def _mcp_url() -> str:
     if not url:
         return "http://localhost:8000/mcp/"
     return url if url.endswith("/") else f"{url}/"
+
+
+def _tool_timeout_seconds(tool_name: str) -> float:
+    settings = get_settings()
+    if tool_name in {"record_drink", "update_menu"}:
+        return max(float(settings.agent_tool_write_timeout_seconds or 0), 0.1)
+    return max(float(settings.agent_tool_timeout_seconds or 0), 0.1)
+
+
+def _dependency_breaker(name: str):
+    settings = get_settings()
+    return get_circuit_breaker(
+        name,
+        failure_threshold=settings.dependency_circuit_failure_threshold,
+        recovery_timeout_seconds=settings.dependency_circuit_recovery_seconds,
+    )
+
+
+def _llm_degraded_reply(state: dict[str, Any], error: DependencyError) -> str:
+    latest_tool = state.get("tool_result")
+    if isinstance(latest_tool, dict) and latest_tool.get("ok") is not False:
+        return "我已经拿到工具结果了，但当前总结服务有点忙。你可以直接换个更短的问题，我会继续基于刚才的数据帮你。"
+    if error.category == "timeout":
+        return "我这边的推理服务刚刚超时了。可以先试更直接的问法，比如“今天喝了什么”“这周喝了几杯”或“推荐喜茶果茶”。"
+    return "我这边的推理服务暂时不太稳定。可以先试更直接的查询，我会优先走更快的路径帮你完成。"
 
 
 async def get_mcp_tools() -> list[BaseTool]:
@@ -239,18 +265,21 @@ async def llm_node(state: dict[str, Any], runtime: dict[str, Any]) -> dict[str, 
 
     first = messages[0]
     has_system = isinstance(first, tuple) and len(first) >= 1 and first[0] == "system"
-    # 若上游未显式传 system 消息，则注入默认系统提示词
-    base_messages = messages if has_system else [("system", SYSTEM_PROMPT), *messages]
+    base_messages = list(messages)
     context = get_agent_context() or {}
     thread_id = str(context.get("thread_id") or "")
     try:
         user_id = _current_identity(state.get("user_id"))
     except PermissionError:
         user_id = ""
-    memory_bundle: dict[str, Any] = {"prompts": [], "diagnostics": {}}
+    memory_bundle: dict[str, Any] = {"prompts": [], "diagnostics": {}, "context_version": ""}
+    system_prompt = ""
+    system_prompt_version = ""
     if thread_id and user_id:
-        # 仅在 thread_id / user_id 完整时做记忆检索，避免匿名或无线程请求污染链路
-        memory_bundle = build_agent_prompt_context(user_id, thread_id, messages, include_metadata=True)
+        prompt_bundle = await asyncio.to_thread(build_prompt_bundle, user_id=user_id, thread_id=thread_id, messages=messages)
+        memory_bundle = dict(prompt_bundle.get("memory_bundle") or {})
+        system_prompt = str(prompt_bundle.get("system_prompt") or "")
+        system_prompt_version = str(prompt_bundle.get("system_prompt_version") or "")
     memory_messages = list(memory_bundle.get("prompts") or [])
     diagnostics = dict(memory_bundle.get("diagnostics") or {})
     if diagnostics:
@@ -269,11 +298,47 @@ async def llm_node(state: dict[str, Any], runtime: dict[str, Any]) -> dict[str, 
                 default=str,
             )
         )
+        logger.info(
+            json.dumps(
+                {
+                    "event": "agent_prompt_versions",
+                    "thread_id": thread_id,
+                    "system_prompt_version": system_prompt_version or get_settings().agent_system_prompt_version,
+                    "context_version": memory_bundle.get("context_version") or get_settings().agent_memory_context_version,
+                },
+                ensure_ascii=False,
+                default=str,
+            )
+        )
 
-    # 最终 prompt 顺序为: system -> memory context -> 原始对话消息
-    prompt_messages = [base_messages[0], *memory_messages, *base_messages[1:]] if has_system or base_messages else base_messages
+    if has_system:
+        prompt_messages = [base_messages[0], *memory_messages, *base_messages[1:]]
+    else:
+        prompt_messages = [("system", system_prompt or "你是 Bobo 奶茶智能助手。"), *memory_messages, *base_messages]
 
-    response = await llm.ainvoke(prompt_messages)
+    async def _call_llm():
+        return await llm.ainvoke(prompt_messages)
+
+    try:
+        response = await call_with_resilience(
+            "llm.chat",
+            _call_llm,
+            timeout_seconds=get_settings().llm_request_timeout_seconds,
+            breaker=_dependency_breaker("llm.chat"),
+        )
+    except DependencyError as exc:
+        logger.warning(
+            json.dumps(
+                {
+                    "event": "agent_llm_degraded",
+                    "category": exc.category,
+                    "detail": str(exc),
+                },
+                ensure_ascii=False,
+                default=str,
+            )
+        )
+        return {"messages": [AIMessage(content=_llm_degraded_reply(state, exc))]}
     return {"messages": [response]}
 
 
@@ -292,22 +357,23 @@ async def _invoke_tool(tool_obj: BaseTool, args: dict[str, Any]) -> Any:
     返回:
         工具执行结果。
     """
+    tool_name = getattr(tool_obj, "name", "unknown")
     maybe_ainvoke = getattr(tool_obj, "ainvoke", None)
     if callable(maybe_ainvoke):
-        return await maybe_ainvoke(args)
+        return await asyncio.wait_for(maybe_ainvoke(args), timeout=_tool_timeout_seconds(tool_name))
 
     maybe_invoke = getattr(tool_obj, "invoke", None)
     if callable(maybe_invoke):
-        result = maybe_invoke(args)
+        result = await asyncio.wait_for(asyncio.to_thread(maybe_invoke, args), timeout=_tool_timeout_seconds(tool_name))
         if isinstance(result, Awaitable):
-            return await result
+            return await asyncio.wait_for(result, timeout=_tool_timeout_seconds(tool_name))
         return result
 
     fn = getattr(tool_obj, "func", None)
     if callable(fn):
-        result = fn(**args)
+        result = await asyncio.wait_for(asyncio.to_thread(fn, **args), timeout=_tool_timeout_seconds(tool_name))
         if isinstance(result, Awaitable):
-            return await result
+            return await asyncio.wait_for(result, timeout=_tool_timeout_seconds(tool_name))
         return result
 
     raise RuntimeError(f"tool {getattr(tool_obj, 'name', '<unknown>')} is not invokable")
@@ -374,9 +440,17 @@ async def tool_node(state: dict[str, Any], runtime: dict[str, Any]) -> dict[str,
         tool_obj = tool_lookup.get(name)
         if tool_obj is None:
             # 未知工具也要返回结构化错误，避免 LLM 无法理解失败原因
-            payload = {"ok": False, "error": f"unknown_tool:{name}"}
+            payload = {
+                "ok": False,
+                "error": f"unknown_tool:{name}",
+                "error_category": "unknown_tool",
+                "error_type": "unknown_tool",
+                "retryable": False,
+                "dependency": f"tool:{name}",
+            }
         else:
             try:
+                validated_args = validate_tool_args(name or "unknown", contextualized_args)
                 # 工具执行前后都写审计事件，便于后续排查 Agent 行为
                 audit_tool_event(
                     name or "unknown",
@@ -385,10 +459,10 @@ async def tool_node(state: dict[str, Any], runtime: dict[str, Any]) -> dict[str,
                     request_id=contextualized_args.get("request_id"),
                     thread_id=contextualized_args.get("thread_id"),
                     source=contextualized_args.get("source"),
-                    args=list(contextualized_args.keys()),
+                    args=list(validated_args.keys()),
                 )
-                data = await _invoke_tool(tool_obj, contextualized_args)
-                payload = data if isinstance(data, dict) else {"result": data}
+                data = await _invoke_tool(tool_obj, validated_args)
+                payload = validate_tool_result(name or "unknown", data if isinstance(data, dict) else {"result": data})
                 audit_tool_event(
                     name or "unknown",
                     "invoke_success",
@@ -408,7 +482,7 @@ async def tool_node(state: dict[str, Any], runtime: dict[str, Any]) -> dict[str,
                     source=contextualized_args.get("source"),
                     error=str(exc),
                 )
-                payload = {"ok": False, "error": str(exc)}
+                payload = build_tool_error_payload(name or "unknown", exc)
 
         latest_result = payload
         tool_messages.append(

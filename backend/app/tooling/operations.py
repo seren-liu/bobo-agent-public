@@ -10,9 +10,8 @@ from app.core.brands import canonicalize_brand_name
 from app.core.config import get_settings, to_psycopg_conninfo
 from app.memory.profile import get_profile
 from app.models.db import insert_records, query_calendar, query_day, query_recent, query_stats
-from app.observability import observe_menu_search
+from app.services.menu_search import get_menu_search_service
 from app.services.menu_ops import MenuActionError, get_menu_ops_service
-from app.services.qdrant import QdrantService
 from app.tooling.context import audit_tool_event, resolve_tool_context
 
 
@@ -166,10 +165,13 @@ async def search_menu_impl(
         query=query,
         brand=brand,
     )
-    service = QdrantService()
-    results = await service.search(query=query, brand=brand, top_k=5)
+    results = await get_menu_search_service().search(
+        query=query,
+        brand=brand,
+        top_k=5,
+        source=context["source"],
+    )
     payload = {"results": results, "query": query, "brand": brand}
-    observe_menu_search(source=context["source"], brand_filter=bool(brand), outcome="success", result_count=len(results))
     audit_tool_event(
         "search_menu",
         "success",

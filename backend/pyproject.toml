@@ -31,6 +31,7 @@ dependencies = [
   "cos-python-sdk-v5>=1.9.41",
   "fastmcp>=2.0",
   "httpx>=0.27",
+  "redis>=5.0",
 ]
 
 [project.optional-dependencies]

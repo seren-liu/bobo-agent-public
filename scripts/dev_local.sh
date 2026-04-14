@@ -16,6 +16,7 @@ Usage:
   bash scripts/dev_local.sh down            # stop local dev stack
   bash scripts/dev_local.sh ps              # show stack status
   bash scripts/dev_local.sh backend         # run backend locally on host (uvicorn --reload)
+  bash scripts/dev_local.sh worker          # run memory worker locally on host
   bash scripts/dev_local.sh test            # run backend tests locally
 EOF
 }
@@ -121,6 +122,14 @@ run_backend() {
   uvicorn app.main:app --host 0.0.0.0 --port "${BACKEND_PORT:-8000}" --reload
 }
 
+run_worker() {
+  require_cmd python3
+  prepare_backend_env
+  export MEMORY_WORKER_MODE=disabled
+  echo "[dev-local] memory worker polling every ${MEMORY_WORKER_POLL_INTERVAL_SECONDS:-2.0}s"
+  python -m app.memory.worker
+}
+
 run_test() {
   require_cmd python3
   prepare_backend_env
@@ -134,6 +143,7 @@ case "$cmd" in
   down) run_down ;;
   ps) run_ps ;;
   backend) run_backend ;;
+  worker) run_worker ;;
   test) run_test ;;
   *) usage; exit 1 ;;
 esac

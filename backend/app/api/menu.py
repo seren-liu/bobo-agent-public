@@ -1,13 +1,12 @@
 from __future__ import annotations
-
 from functools import lru_cache
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
+from app.core.authz import MENU_ADMIN_CAPABILITY
 from app.services.menu_ops import MenuActionError, get_menu_ops_service
-from app.observability import observe_menu_search
-from app.services.qdrant import QdrantService
+from app.services.menu_search import MenuSearchService, get_menu_search_service
 
 router = APIRouter(prefix="/bobo/menu", tags=["menu"])
 
@@ -19,6 +18,8 @@ class MenuSearchItem(BaseModel):
     size: str | None = None
     price: float | None = None
     description: str | None = None
+    item_type: str | None = None
+    drink_category: str | None = None
     score: float
 
 
@@ -32,6 +33,8 @@ class MenuCreateRequest(BaseModel):
     size: str | None = None
     price: float | None = None
     description: str | None = None
+    item_type: str | None = None
+    drink_category: str | None = None
     sugar_opts: list[str] = Field(default_factory=list)
     ice_opts: list[str] = Field(default_factory=list)
 
@@ -41,6 +44,8 @@ class MenuCreateResponse(BaseModel):
     brand: str
     name: str
     description: str | None = None
+    item_type: str | None = None
+    drink_category: str | None = None
 
 
 class MenuUpdateRequest(BaseModel):
@@ -49,6 +54,8 @@ class MenuUpdateRequest(BaseModel):
     size: str | None = None
     price: float | None = None
     description: str | None = None
+    item_type: str | None = None
+    drink_category: str | None = None
     sugar_opts: list[str] | None = None
     ice_opts: list[str] | None = None
     is_active: bool | None = None
@@ -60,12 +67,21 @@ class MenuUpdateResponse(BaseModel):
     name: str
     price: float | None = None
     description: str | None = None
+    item_type: str | None = None
+    drink_category: str | None = None
     is_active: bool
 
 
 @lru_cache(maxsize=1)
-def get_qdrant_service() -> QdrantService:
-    return QdrantService()
+def get_menu_search() -> MenuSearchService:
+    return get_menu_search_service()
+
+
+def _require_menu_admin(request: Request) -> None:
+    capabilities = tuple(getattr(request.state, "auth_capabilities", ()) or ())
+    if "*" in capabilities or MENU_ADMIN_CAPABILITY in capabilities:
+        return
+    raise HTTPException(status_code=403, detail="missing capability: menu:admin")
 
 
 @router.get("/search", response_model=MenuSearchResponse)
@@ -74,25 +90,32 @@ async def search_menu(
     brand: str | None = Query(default=None),
     top_k: int = Query(default=5, ge=1, le=20),
 ) -> MenuSearchResponse:
-    service = get_qdrant_service()
-    results = await service.search(query=q, brand=brand, top_k=top_k)
-    observe_menu_search(source="api", brand_filter=bool(brand), outcome="success", result_count=len(results))
+    results = await get_menu_search().search(query=q, brand=brand, top_k=top_k, source="api")
     return MenuSearchResponse(results=results)
 
 
 @router.post("", response_model=MenuCreateResponse, status_code=201)
-async def create_menu(payload: MenuCreateRequest) -> MenuCreateResponse:
+async def create_menu(payload: MenuCreateRequest, request: Request) -> MenuCreateResponse:
+    _require_menu_admin(request)
     try:
         result = await get_menu_ops_service().add_item(payload.model_dump())
     except MenuActionError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     item = result.get("item") or {}
-    return MenuCreateResponse(id=item["id"], brand=item["brand"], name=item["name"], description=item.get("description"))
+    return MenuCreateResponse(
+        id=item["id"],
+        brand=item["brand"],
+        name=item["name"],
+        description=item.get("description"),
+        item_type=item.get("item_type"),
+        drink_category=item.get("drink_category"),
+    )
 
 
 @router.put("/{menu_id}", response_model=MenuUpdateResponse)
-async def update_menu(menu_id: str, payload: MenuUpdateRequest) -> MenuUpdateResponse:
+async def update_menu(menu_id: str, payload: MenuUpdateRequest, request: Request) -> MenuUpdateResponse:
+    _require_menu_admin(request)
     fields = payload.model_dump(exclude_unset=True)
     try:
         result = await get_menu_ops_service().update_item({"id": menu_id, **fields})
@@ -108,12 +131,15 @@ async def update_menu(menu_id: str, payload: MenuUpdateRequest) -> MenuUpdateRes
         name=item["name"],
         price=item.get("price"),
         description=item.get("description"),
+        item_type=item.get("item_type"),
+        drink_category=item.get("drink_category"),
         is_active=bool(item.get("is_active", True)),
     )
 
 
 @router.delete("/{menu_id}")
-async def delete_menu(menu_id: str) -> dict[str, bool]:
+async def delete_menu(menu_id: str, request: Request) -> dict[str, bool]:
+    _require_menu_admin(request)
     try:
         await get_menu_ops_service().delete_item({"id": menu_id})
     except MenuActionError as exc:

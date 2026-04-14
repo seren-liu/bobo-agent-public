@@ -9,7 +9,7 @@ os.environ["MCP_SERVICE_TOKEN"] = "mcp-test-token"
 
 from app.api import auth as auth_api  # noqa: E402
 from app.core.authz import default_user_capabilities  # noqa: E402
-from app.core.config import get_settings  # noqa: E402
+from app.core.config import get_settings, validate_security_settings, Settings  # noqa: E402
 from app.core.security import create_refresh_token, decode_token, hash_password  # noqa: E402
 from app.main import _is_mcp_service_token, app  # noqa: E402
 
@@ -110,3 +110,47 @@ def test_refresh_token_is_rejected_on_protected_routes():
 def test_mcp_accepts_service_bearer_token():
     settings = get_settings()
     assert _is_mcp_service_token(settings.mcp_service_token, settings) is True
+
+
+def test_mcp_rejects_derived_service_token_in_production():
+    settings = Settings(
+        env="production",
+        jwt_secret="prod-secret-123",
+        mcp_service_token="prod-mcp-token-123",
+        metrics_access_token="prod-metrics-token",
+    )
+
+    assert _is_mcp_service_token("prod-secret-123:mcp", settings) is False
+    assert _is_mcp_service_token("prod-mcp-token-123", settings) is True
+
+
+def test_production_settings_reject_default_jwt_secret():
+    settings = Settings(
+        env="production",
+        jwt_secret="change_me",
+        mcp_service_token="prod-mcp-token",
+        metrics_access_token="prod-metrics-token",
+    )
+
+    try:
+        validate_security_settings(settings)
+    except RuntimeError as exc:
+        assert "JWT_SECRET" in str(exc)
+    else:
+        raise AssertionError("expected production settings validation to fail")
+
+
+def test_production_settings_require_explicit_mcp_and_metrics_tokens():
+    settings = Settings(
+        env="production",
+        jwt_secret="prod-secret-123",
+        mcp_service_token="prod-secret-123:mcp",
+        metrics_access_token="",
+    )
+
+    try:
+        validate_security_settings(settings)
+    except RuntimeError as exc:
+        assert "MCP_SERVICE_TOKEN" in str(exc) or "METRICS_ACCESS_TOKEN" in str(exc)
+    else:
+        raise AssertionError("expected production settings validation to fail")

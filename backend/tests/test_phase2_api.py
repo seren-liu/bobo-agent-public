@@ -7,10 +7,15 @@ os.environ["JWT_SECRET"] = "test-secret"
 
 from app.main import _is_mcp_service_token, app  # noqa: E402
 from app.core.config import get_settings  # noqa: E402
+from app.core.rate_limit import clear_rate_limits  # noqa: E402
 from app.core.security import create_access_token  # noqa: E402
 
 
 client = TestClient(app)
+
+
+def setup_function():
+    clear_rate_limits()
 
 
 def _auth_header() -> dict[str, str]:
@@ -57,4 +62,25 @@ def test_stats_json_shape():
 
 
 def test_mcp_service_token_bypasses_general_jwt_guard():
-    assert _is_mcp_service_token("test-secret:mcp", get_settings()) is True
+    settings = get_settings()
+    expected = settings.mcp_service_token or "test-secret:mcp"
+    assert _is_mcp_service_token(expected, settings) is True
+
+
+def test_login_rate_limit(monkeypatch):
+    from app.api import auth as auth_api
+
+    calls = {"count": 0}
+
+    def _fake_limit(**kwargs):
+        calls["count"] += 1
+        if calls["count"] > 1:
+            raise auth_api.HTTPException(status_code=429, detail="too many requests")
+
+    monkeypatch.setattr(auth_api, "enforce_rate_limit", _fake_limit)
+
+    resp1 = client.post("/bobo/auth/login", json={"username": "none@example.com", "password": "wrong"})
+    resp2 = client.post("/bobo/auth/login", json={"username": "none@example.com", "password": "wrong"})
+
+    assert resp1.status_code in {401, 429}
+    assert resp2.status_code == 429

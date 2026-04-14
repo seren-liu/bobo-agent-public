@@ -29,6 +29,8 @@ def upgrade() -> None:
           size VARCHAR,
           price DECIMAL(8,2),
           description TEXT,
+          item_type VARCHAR(24),
+          drink_category VARCHAR(32),
           sugar_opts TEXT[],
           ice_opts TEXT[],
           is_active BOOLEAN DEFAULT TRUE,
@@ -86,6 +88,8 @@ def upgrade() -> None:
     )
 
     op.execute("ALTER TABLE menu ADD COLUMN IF NOT EXISTS description TEXT")
+    op.execute("ALTER TABLE menu ADD COLUMN IF NOT EXISTS item_type VARCHAR(24)")
+    op.execute("ALTER TABLE menu ADD COLUMN IF NOT EXISTS drink_category VARCHAR(32)")
     op.execute("ALTER TABLE user_profile ADD COLUMN IF NOT EXISTS nickname VARCHAR(80)")
     op.execute("ALTER TABLE records ADD COLUMN IF NOT EXISTS user_id UUID")
     op.execute("ALTER TABLE records ADD COLUMN IF NOT EXISTS mood VARCHAR(120)")

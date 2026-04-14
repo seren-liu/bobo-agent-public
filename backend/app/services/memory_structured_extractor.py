@@ -7,6 +7,8 @@ import re
 from typing import Any
 
 from app.core.brands import canonicalize_brand_names, known_brand_names
+from app.core.config import get_settings
+from app.core.resilience import classify_dependency_error, get_circuit_breaker
 from app.services.llm_budget import extract_usage_tokens, record_usage
 
 logger = logging.getLogger("bobo.memory.structured")
@@ -239,8 +241,15 @@ class MemoryStructuredExtractorService:
     def _extract_via_llm(self, messages: list[dict[str, Any]], rule_facts: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
         client = self._create_client()
         response = None
+        settings = get_settings()
+        breaker = get_circuit_breaker(
+            "llm.memory_extraction",
+            failure_threshold=settings.dependency_circuit_failure_threshold,
+            recovery_timeout_seconds=settings.dependency_circuit_recovery_seconds,
+        )
         for response_format in (STRICT_RESPONSE_FORMAT, {"type": "json_object"}, None):
             try:
+                breaker.before_call()
                 kwargs: dict[str, Any] = {
                     "model": self.model,
                     "messages": self._build_messages(messages, rule_facts),
@@ -259,14 +268,18 @@ class MemoryStructuredExtractorService:
                         output_tokens=usage[1],
                         usage_kind="memory_extraction",
                     )
+                breaker.on_success()
                 break
             except Exception as exc:
+                breaker.on_failure()
+                error = classify_dependency_error(exc, "llm.memory_extraction")
                 logger.warning(
                     json.dumps(
                         {
                             "event": "memory_structured_extraction_llm_error",
                             "model": self.model,
-                            "error": str(exc),
+                            "error": str(error),
+                            "error_category": error.category,
                         },
                         ensure_ascii=False,
                     )

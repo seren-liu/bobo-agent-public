@@ -217,3 +217,24 @@ def test_build_extraction_result_falls_back_when_structured_extractor_errors(mon
     assert result["diagnostics"]["structured_error_count"] == 1
     assert result["profile_updates"]["interaction_preferences"]["reply_style"] == "brief"
     assert result["memory_upserts"][0]["normalized_fact"]["kind"] == "budget_constraint"
+
+
+def test_build_extraction_result_routes_temporary_category_preference_to_memory(monkeypatch):
+    messages = [
+        {
+            "id": "msg-temp-category",
+            "role": "user",
+            "content": "这段时间我想喝果茶类",
+        }
+    ]
+
+    monkeypatch.setattr(extraction.repository, "list_recent_user_messages", lambda user_id, thread_key, limit=10: messages[::-1])
+
+    result = extraction.build_extraction_result("u-temp-category", "thread-temp-category")
+
+    assert result["profile_updates"] == {}
+    assert len(result["memory_upserts"]) == 1
+    assert result["memory_upserts"][0]["memory_type"] == "preference"
+    assert result["memory_upserts"][0]["scope"] == "recommendation"
+    assert result["memory_upserts"][0]["normalized_fact"]["kind"] == "drink_preference"
+    assert result["memory_upserts"][0]["normalized_fact"]["value"] == ["fruit_tea"]

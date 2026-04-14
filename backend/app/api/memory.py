@@ -4,6 +4,7 @@ from uuid import uuid4
 
 from fastapi import APIRouter, Body, HTTPException, Request
 
+from app.core.threads import normalize_session_thread_id
 from app.memory.extraction import build_extraction_result, persist_extraction_result
 from app.memory.jobs import enqueue_memory_job, process_memory_jobs
 from app.memory.models import (
@@ -33,7 +34,8 @@ def _request_user_id(request: Request) -> str:
 @router.post("/threads", response_model=ThreadResponse)
 def create_thread(payload: ThreadCreateRequest, request: Request) -> ThreadResponse:
     user_id = _request_user_id(request)
-    thread_key = payload.thread_key or f"user-{user_id}:session-{uuid4().hex[:12]}"
+    raw_thread_key = payload.thread_key or uuid4().hex[:12]
+    thread_key = normalize_session_thread_id(user_id, raw_thread_key)
     row = repository.create_thread(user_id, thread_key, payload.title)
     return ThreadResponse(**row)
 

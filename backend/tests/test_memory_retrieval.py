@@ -204,3 +204,21 @@ def test_build_agent_prompt_context_applies_budget_and_deduplicates(monkeypatch)
     assert rendered.count("最近预算偏紧") == 1
     assert "回答风格：brief" in rendered
     assert "当前会话摘要" in rendered
+
+
+def test_build_agent_prompt_context_returns_context_version(monkeypatch):
+    monkeypatch.setattr(
+        retrieval.repository,
+        "get_profile",
+        lambda user_id: {
+            "drink_preferences": {"default_sugar": "少糖"},
+            "interaction_preferences": {"reply_style": "brief"},
+            "budget_preferences": {},
+        },
+    )
+    monkeypatch.setattr(retrieval, "load_latest_thread_summary", lambda *_args, **_kwargs: "")
+    monkeypatch.setattr(retrieval, "search_relevant_memories", lambda *_args, **_kwargs: [])
+
+    bundle = retrieval.build_agent_prompt_context("u-1", "thread-1", [("user", "推荐便宜一点")], include_metadata=True)
+
+    assert bundle["context_version"] == "bobo-agent-memory-context.v1"

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 
 
 HTTP_REQUESTS_TOTAL = Counter(
@@ -157,6 +157,49 @@ BUDGET_LLM_COST_CNY_TOTAL = Counter(
     ("model", "usage_kind"),
 )
 
+DEPENDENCY_REQUESTS_TOTAL = Counter(
+    "bobo_dependency_requests_total",
+    "Total dependency calls guarded by resilience controls.",
+    ("dependency", "outcome", "category"),
+)
+
+DEPENDENCY_REQUEST_DURATION_SECONDS = Histogram(
+    "bobo_dependency_request_duration_seconds",
+    "Latency of dependency calls guarded by resilience controls.",
+    ("dependency", "outcome"),
+    buckets=(0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 20, 30, 60),
+)
+
+DEPENDENCY_CIRCUIT_STATE = Gauge(
+    "bobo_dependency_circuit_state",
+    "Current one-hot circuit state for dependencies.",
+    ("dependency", "state"),
+)
+
+AGENT_FAST_PATH_TOTAL = Counter(
+    "bobo_agent_fast_path_total",
+    "Fast path selection and result counters.",
+    ("path", "outcome"),
+)
+
+TASK_EXECUTIONS_TOTAL = Counter(
+    "bobo_task_executions_total",
+    "Total task executions across agent fast paths and workers.",
+    ("task", "outcome", "source"),
+)
+
+MEMORY_WORKER_JOB_LAG_SECONDS = Histogram(
+    "bobo_memory_worker_job_lag_seconds",
+    "Lag between job scheduled_at and actual worker pickup/completion.",
+    ("job_type", "stage"),
+    buckets=(0.01, 0.1, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600),
+)
+
+MEMORY_WORKER_PENDING_JOBS = Gauge(
+    "bobo_memory_worker_pending_jobs",
+    "Current pending memory jobs in queue.",
+)
+
 
 def metrics_payload() -> bytes:
     return generate_latest()
@@ -235,6 +278,34 @@ def observe_budget_llm_usage(*, model: str, usage_kind: str, input_tokens: int, 
     BUDGET_LLM_TOKENS_TOTAL.labels(model=clean_model, usage_kind=clean_usage_kind, direction="input").inc(max(input_tokens, 0))
     BUDGET_LLM_TOKENS_TOTAL.labels(model=clean_model, usage_kind=clean_usage_kind, direction="output").inc(max(output_tokens, 0))
     BUDGET_LLM_COST_CNY_TOTAL.labels(model=clean_model, usage_kind=clean_usage_kind).inc(max(estimated_cost_cny, 0.0))
+
+
+def observe_dependency_call(*, dependency: str, outcome: str, category: str, duration_seconds: float) -> None:
+    clean_dependency = dependency or "unknown"
+    clean_outcome = outcome or "unknown"
+    clean_category = category or "none"
+    DEPENDENCY_REQUESTS_TOTAL.labels(dependency=clean_dependency, outcome=clean_outcome, category=clean_category).inc()
+    DEPENDENCY_REQUEST_DURATION_SECONDS.labels(dependency=clean_dependency, outcome=clean_outcome).observe(max(duration_seconds, 0.0))
+
+
+def set_dependency_circuit_state(*, dependency: str, state: str, value: int) -> None:
+    DEPENDENCY_CIRCUIT_STATE.labels(dependency=dependency or "unknown", state=state or "unknown").set(max(int(value or 0), 0))
+
+
+def observe_fast_path(*, path: str, outcome: str) -> None:
+    AGENT_FAST_PATH_TOTAL.labels(path=path or "unknown", outcome=outcome or "unknown").inc()
+
+
+def observe_task_execution(*, task: str, outcome: str, source: str) -> None:
+    TASK_EXECUTIONS_TOTAL.labels(task=task or "unknown", outcome=outcome or "unknown", source=source or "unknown").inc()
+
+
+def observe_memory_worker_job(*, job_type: str, stage: str, lag_seconds: float) -> None:
+    MEMORY_WORKER_JOB_LAG_SECONDS.labels(job_type=job_type or "unknown", stage=stage or "unknown").observe(max(lag_seconds, 0.0))
+
+
+def set_memory_worker_pending_jobs(count: int) -> None:
+    MEMORY_WORKER_PENDING_JOBS.set(max(int(count or 0), 0))
 
 
 def _status_class(status_code: int) -> str:

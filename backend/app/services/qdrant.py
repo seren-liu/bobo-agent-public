@@ -16,8 +16,10 @@ from psycopg.rows import dict_row
 
 from app.core.brands import canonicalize_brand_name
 from app.core.config import get_settings, to_psycopg_conninfo
+from app.core.resilience import DependencyError, call_with_resilience, get_circuit_breaker
 from app.observability import observe_qdrant_search
 from app.services.embedding import EmbeddingService
+from app.services.menu_typing import infer_menu_taxonomy
 
 logger = logging.getLogger("bobo.qdrant")
 
@@ -47,6 +49,27 @@ _DEFAULT_RRF_K = 60
 _DEFAULT_SPARSE_SCAN_LIMIT = 1200
 _ASCII_TOKEN_PATTERN = re.compile(r"[a-z0-9]{2,}")
 _HAN_TOKEN_PATTERN = re.compile(r"[\u4e00-\u9fff]+")
+_STOP_TERMS = ("的", "了", "呢", "呀", "啊", "请", "给我", "来一杯", "一杯", "一下", "推荐")
+_NON_DRINK_TERMS = (
+    "薯片",
+    "零食",
+    "饼干",
+    "周边",
+    "礼品卡",
+    "礼包",
+    "纸袋",
+    "徽章",
+    "杯子",
+    "吸管",
+)
+_PACKAGED_TERMS = (
+    "保质期",
+    "净含量",
+    "规格",
+    "盒",
+    "袋",
+)
+_TEXTURE_TERMS = ("清爽", "清新", "解腻", "爽口", "轻盈", "不腻", "酸甜", "果香", "鲜")
 
 class QdrantService:
     def __init__(
@@ -75,6 +98,8 @@ class QdrantService:
         return [
             ("brand", models.PayloadSchemaType.KEYWORD),
             ("is_active", models.PayloadSchemaType.BOOL),
+            ("item_type", models.PayloadSchemaType.KEYWORD),
+            ("drink_category", models.PayloadSchemaType.KEYWORD),
         ]
 
     @staticmethod
@@ -137,18 +162,69 @@ class QdrantService:
     def _normalize_query_text(value: str) -> str:
         return re.sub(r"\s+", "", value or "").lower()
 
+    def _meaningful_query_terms(self, query: str) -> list[str]:
+        normalized = self._normalize_query_text(query)
+        if not normalized:
+            return []
+
+        terms: list[str] = []
+        for token in _MENU_CATEGORY_TERMS + _INTENT_TERMS + _TEXTURE_TERMS:
+            if token and token in normalized and token not in terms:
+                terms.append(token)
+
+        cleaned = normalized
+        for token in _STOP_TERMS:
+            cleaned = cleaned.replace(token, "")
+
+        for block in _HAN_TOKEN_PATTERN.findall(cleaned):
+            if len(block) <= 1:
+                continue
+            if block not in terms:
+                terms.append(block)
+            upper = min(len(block), 4)
+            lower = 2 if len(block) >= 2 else len(block)
+            for size in range(upper, lower - 1, -1):
+                for idx in range(0, len(block) - size + 1):
+                    piece = block[idx : idx + size]
+                    if piece in _STOP_TERMS or len(piece.strip()) <= 1:
+                        continue
+                    if piece not in terms:
+                        terms.append(piece)
+        return terms[:32]
+
+    def _prepare_search_query(self, query: str) -> str:
+        normalized = self._normalize_query_text(query)
+        if not normalized:
+            return query
+        cleaned = normalized
+        for token in _STOP_TERMS:
+            cleaned = cleaned.replace(token, "")
+        return cleaned or normalized
+
+    def _looks_like_non_drink(self, item: dict[str, Any]) -> bool:
+        text = self._normalize_query_text(f"{item.get('name') or ''} {item.get('description') or ''}")
+        return any(term in text for term in _NON_DRINK_TERMS)
+
+    def _looks_like_packaged_goods(self, item: dict[str, Any]) -> bool:
+        text = self._normalize_query_text(f"{item.get('name') or ''} {item.get('description') or ''}")
+        return any(term in text for term in _PACKAGED_TERMS)
+
     def _lexical_score(self, query: str, item: dict[str, Any]) -> float:
         query_text = self._normalize_query_text(query)
         item_text = self._normalize_query_text(f"{item.get('name') or ''} {item.get('description') or ''}")
         score = 0.0
 
-        query_terms = [term for term in _MENU_CATEGORY_TERMS if term in query_text]
-        if not query_terms and query_text:
-            query_terms = [query_text]
+        query_terms = self._meaningful_query_terms(query)
+        category_terms = [term for term in _MENU_CATEGORY_TERMS if term in query_text]
 
         for term in query_terms:
             if term and term in item_text:
-                score += 0.55
+                if term in _TEXTURE_TERMS:
+                    score += 0.38
+                elif term in _MENU_CATEGORY_TERMS:
+                    score += 0.45
+                else:
+                    score += 0.3
 
         if any(term in query_text for term in _INTENT_TERMS):
             if any(term in item_text for term in ("经典", "招牌", "热门", "人气", "爆款")):
@@ -161,6 +237,11 @@ class QdrantService:
         name = str(item.get("name") or "")
         if name and name.lower() in query_text:
             score += 0.45
+
+        if category_terms and (
+            str(item.get("item_type") or "") not in {"", "drink"} or self._looks_like_non_drink(item)
+        ):
+            score -= 0.9
 
         return score
 
@@ -175,26 +256,17 @@ class QdrantService:
         if not normalized:
             return []
 
-        tokens: list[str] = []
-        for token in _MENU_CATEGORY_TERMS + _INTENT_TERMS:
-            if token and token.lower() in normalized and token not in tokens:
-                tokens.append(token)
+        tokens: list[str] = list(self._meaningful_query_terms(query))
 
         for token in _ASCII_TOKEN_PATTERN.findall(normalized):
             if token not in tokens:
                 tokens.append(token)
 
-        for block in _HAN_TOKEN_PATTERN.findall(normalized):
-            if len(block) <= 4:
-                if block not in tokens:
-                    tokens.append(block)
-                continue
-            for size in (3, 2):
-                for idx in range(0, len(block) - size + 1):
-                    piece = block[idx : idx + size]
-                    if piece not in tokens:
-                        tokens.append(piece)
-
+        cleaned = normalized
+        for stop in _STOP_TERMS:
+            cleaned = cleaned.replace(stop, "")
+        if cleaned and cleaned not in tokens:
+            tokens.append(cleaned)
         if normalized not in tokens:
             tokens.append(normalized)
         return tokens[:24]
@@ -220,7 +292,7 @@ class QdrantService:
             return []
 
         sql = """
-        SELECT id::text AS id, brand, name, size, price, description
+        SELECT id::text AS id, brand, name, size, price, description, item_type, drink_category
         FROM menu
         WHERE is_active = TRUE
         """
@@ -235,7 +307,14 @@ class QdrantService:
         try:
             with psycopg.connect(database_url, row_factory=dict_row) as conn, conn.cursor() as cur:
                 cur.execute(sql, params)
-                return list(cur.fetchall() or [])
+                rows = list(cur.fetchall() or [])
+                enriched: list[dict[str, Any]] = []
+                for row in rows:
+                    item = dict(row)
+                    if not item.get("item_type"):
+                        item.update(infer_menu_taxonomy(item))
+                    enriched.append(item)
+                return enriched
         except Exception:
             return []
 
@@ -288,6 +367,8 @@ class QdrantService:
                     "size": item.get("size"),
                     "price": item.get("price"),
                     "description": item.get("description"),
+                    "item_type": item.get("item_type"),
+                    "drink_category": item.get("drink_category"),
                     "score": score,
                     "dense_score": 0.0,
                     "sparse_score": score,
@@ -336,6 +417,8 @@ class QdrantService:
                     "size": item.get("size"),
                     "price": item.get("price"),
                     "description": item.get("description"),
+                    "item_type": item.get("item_type"),
+                    "drink_category": item.get("drink_category"),
                     "score": score,
                     "dense_score": 0.0,
                     "sparse_score": 0.0,
@@ -391,6 +474,8 @@ class QdrantService:
                 "size": item.get("size"),
                 "price": item.get("price"),
                 "description": item.get("description"),
+                "item_type": item.get("item_type"),
+                "drink_category": item.get("drink_category"),
             }
             if current is None:
                 current = {
@@ -405,6 +490,8 @@ class QdrantService:
                 current["rrf_score"] = float(current.get("rrf_score") or 0.0) + self._reciprocal_rank(rank)
 
         out: list[dict[str, Any]] = []
+        normalized_query = self._normalize_query_text(query)
+        query_category_terms = [term for term in _MENU_CATEGORY_TERMS if term in normalized_query]
         for item in merged.values():
             dense_norm = float(item.get("dense_score") or 0.0) / dense_max if dense_max > 0 else 0.0
             sparse_norm = float(item.get("sparse_score") or 0.0) / sparse_max if sparse_max > 0 else 0.0
@@ -415,6 +502,13 @@ class QdrantService:
                 + float(item.get("rrf_score") or 0.0) * 10.0 * 0.18
                 + lexical * 0.22
             )
+            item_text = self._normalize_query_text(f"{item.get('name') or ''} {item.get('description') or ''}")
+            if query_category_terms and not any(term in item_text for term in query_category_terms):
+                final_score -= 0.12
+            if self._looks_like_non_drink(item) and any(term in self._normalize_query_text(query) for term in _MENU_CATEGORY_TERMS):
+                final_score -= 0.35
+            if self._looks_like_packaged_goods(item) and query_category_terms:
+                final_score -= 0.2
             out.append(
                 {
                     "id": item["id"],
@@ -423,6 +517,8 @@ class QdrantService:
                     "size": item.get("size"),
                     "price": item.get("price"),
                     "description": item.get("description"),
+                    "item_type": item.get("item_type"),
+                    "drink_category": item.get("drink_category"),
                     "score": final_score,
                     "dense_score": float(item.get("dense_score") or 0.0),
                     "sparse_score": float(item.get("sparse_score") or 0.0),
@@ -493,11 +589,14 @@ class QdrantService:
         size: str,
         description: str | None,
         is_active: bool,
+        item_type: str | None = None,
+        drink_category: str | None = None,
     ) -> None:
         start = time.perf_counter()
         await self.init_collection()
 
         models = self._get_models()
+        taxonomy = infer_menu_taxonomy({"name": name, "description": description})
         vector = await self._embedding.embed_text(
             " ".join(part for part in [brand, name, description or ""] if part),
             text_type="document",
@@ -509,6 +608,8 @@ class QdrantService:
             "price": float(price) if isinstance(price, (int, float, Decimal)) else 0.0,
             "size": size,
             "description": description or "",
+            "item_type": item_type or taxonomy["item_type"],
+            "drink_category": drink_category or taxonomy["drink_category"],
             "is_active": is_active,
         }
         point = models.PointStruct(id=self._normalize_point_id(menu_id), vector=vector, payload=payload)
@@ -605,12 +706,14 @@ class QdrantService:
     async def search(self, query: str, brand: str | None = None, top_k: int = 5) -> list[dict]:
         start = time.perf_counter()
         brand = canonicalize_brand_name(brand)
+        prepared_query = self._prepare_search_query(query)
         sparse_documents: list[dict[str, Any]] = []
         try:
+            settings = get_settings()
             await self.init_collection()
 
             models = self._get_models()
-            query_vector = await self._embedding.embed_text(query, text_type="query")
+            query_vector = await self._embedding.embed_text(prepared_query, text_type="query")
             pool_limit = max(top_k * 3, top_k)
 
             must = [
@@ -620,16 +723,15 @@ class QdrantService:
                 must.append(models.FieldCondition(key="brand", match=models.MatchValue(value=brand)))
 
             client = self._get_client()
-            if hasattr(client, "search"):
-                points = await client.search(
-                    collection_name=self.collection_name,
-                    query_vector=query_vector,
-                    query_filter=models.Filter(must=must),
-                    limit=pool_limit,
-                    with_payload=True,
-                )
-            else:
-                # qdrant-client >= 1.17 removes `search` in favor of `query_points`.
+            async def _query_points():
+                if hasattr(client, "search"):
+                    return await client.search(
+                        collection_name=self.collection_name,
+                        query_vector=query_vector,
+                        query_filter=models.Filter(must=must),
+                        limit=pool_limit,
+                        with_payload=True,
+                    )
                 result = await client.query_points(
                     collection_name=self.collection_name,
                     query=query_vector,
@@ -637,11 +739,23 @@ class QdrantService:
                     limit=pool_limit,
                     with_payload=True,
                 )
-                points = getattr(result, "points", []) or []
+                return getattr(result, "points", []) or []
+
+            points = await call_with_resilience(
+                f"qdrant.{self.collection_name}",
+                _query_points,
+                timeout_seconds=settings.qdrant_request_timeout_seconds,
+                breaker=get_circuit_breaker(
+                    f"qdrant.{self.collection_name}",
+                    failure_threshold=settings.dependency_circuit_failure_threshold,
+                    recovery_timeout_seconds=settings.dependency_circuit_recovery_seconds,
+                ),
+            )
 
             dense_results: list[dict[str, Any]] = []
             for point in points:
                 payload = point.payload or {}
+                taxonomy = infer_menu_taxonomy(payload)
                 dense_results.append(
                     {
                         "id": str(payload.get("id") or point.id),
@@ -650,6 +764,8 @@ class QdrantService:
                         "size": payload.get("size"),
                         "price": payload.get("price"),
                         "description": payload.get("description"),
+                        "item_type": payload.get("item_type") or taxonomy["item_type"],
+                        "drink_category": payload.get("drink_category") or taxonomy["drink_category"],
                         "score": self._combined_score(query, point),
                     }
                 )
@@ -673,6 +789,7 @@ class QdrantService:
                         "brand": brand,
                         "top_k": top_k,
                         "query_len": len(query),
+                        "prepared_query": prepared_query,
                         "dense_count": len(dense_results),
                         "sparse_count": len(sparse_results),
                         "result_count": len(out),
@@ -684,6 +801,11 @@ class QdrantService:
             )
             return out
         except Exception as exc:
+            error = exc if isinstance(exc, DependencyError) else DependencyError(
+                dependency=f"qdrant.{self.collection_name}",
+                category="upstream_error",
+                detail=str(exc),
+            )
             logger.warning(
                 json.dumps(
                     {
@@ -692,7 +814,8 @@ class QdrantService:
                         "brand": brand,
                         "query": query,
                         "top_k": top_k,
-                        "error": str(exc),
+                        "error": str(error),
+                        "error_category": error.category,
                     },
                     ensure_ascii=False,
                     default=str,
@@ -720,6 +843,7 @@ class QdrantService:
                             "brand": brand,
                             "query": query,
                             "fallback_mode": "sparse_only",
+                            "degraded_reason": error.category,
                             "result_count": len(sparse_results),
                             "duration_ms": round((time.perf_counter() - start) * 1000, 2),
                         },
@@ -745,6 +869,7 @@ class QdrantService:
                             "brand": brand,
                             "query": query,
                             "fallback_mode": "keyword_only",
+                            "degraded_reason": error.category,
                             "result_count": len(keyword_results),
                             "duration_ms": round((time.perf_counter() - start) * 1000, 2),
                         },

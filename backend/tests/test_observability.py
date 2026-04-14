@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 from app.api import agent as agent_api
 from app.api import menu as menu_api
 from app.api import vision as vision_api
+from app.core.config import get_settings
 from app.core.security import create_access_token
 from app.main import app
 from app.models.vision import DrinkItem, VisionResult
@@ -18,6 +19,13 @@ client = TestClient(app)
 
 def _auth_header() -> dict[str, str]:
     return {"Authorization": f"Bearer {create_access_token('u-observability')}"}
+
+
+def _metrics_headers() -> dict[str, str]:
+    settings = get_settings()
+    if settings.metrics_access_token and settings.env.lower() in {"prod", "production"}:
+        return {"Authorization": f"Bearer {settings.metrics_access_token}"}
+    return {}
 
 
 def _metric_value(body: str, metric_name: str, labels: dict[str, str] | None = None) -> float:
@@ -33,7 +41,7 @@ def _metric_value(body: str, metric_name: str, labels: dict[str, str] | None = N
 
 
 def test_metrics_endpoint_records_business_signals(monkeypatch):
-    baseline = client.get("/metrics")
+    baseline = client.get("/metrics", headers=_metrics_headers())
     assert baseline.status_code == 200
     before = baseline.text
 
@@ -58,6 +66,7 @@ def test_metrics_endpoint_records_business_signals(monkeypatch):
             }
         ],
     )
+    monkeypatch.setattr(vision_api._cos_service, "validate_user_file_url", lambda image_url, user_id: "photos/u-observability/2026-04/x.jpg")
     monkeypatch.setattr(vision_api._cos_service, "get_presigned_read_url", lambda url: url)
     monkeypatch.setattr(
         vision_api._vision_service,
@@ -100,14 +109,14 @@ def test_metrics_endpoint_records_business_signals(monkeypatch):
     response = client.post(
         "/bobo/vision/recognize",
         headers=_auth_header(),
-        json={"image_url": "https://example.com/x.jpg", "source_type": "photo"},
+        json={"image_url": "https://bucket.cos.ap-shanghai.myqcloud.com/photos/u-observability/2026-04/x.jpg", "source_type": "photo"},
     )
     assert response.status_code == 200
 
     response = client.get("/bobo/menu/search?q=葡萄&brand=heytea", headers=_auth_header())
     assert response.status_code == 200
 
-    after = client.get("/metrics")
+    after = client.get("/metrics", headers=_metrics_headers())
     assert after.status_code == 200
     body = after.text
 
@@ -138,7 +147,7 @@ def test_metrics_endpoint_tracks_agent_chat(monkeypatch):
     async def _fake_memory_jobs(_user_id: str, _thread_id: str) -> None:
         return None
 
-    baseline = client.get("/metrics").text
+    baseline = client.get("/metrics", headers=_metrics_headers()).text
 
     monkeypatch.setattr(agent_api, "stream_agent_events", _fake_stream)
     monkeypatch.setattr(agent_api.repository, "create_thread", lambda *_args, **_kwargs: {"id": "thread-1"})
@@ -168,7 +177,7 @@ def test_metrics_endpoint_tracks_agent_chat(monkeypatch):
     assert response.status_code == 200
     assert '"type": "done"' in body
 
-    metrics = client.get("/metrics").text
+    metrics = client.get("/metrics", headers=_metrics_headers()).text
     assert _metric_value(
         metrics,
         "bobo_agent_chat_requests_total",
@@ -197,7 +206,7 @@ def test_metrics_endpoint_tracks_agent_chat(monkeypatch):
 
 
 def test_metrics_endpoint_tracks_budget_rejections(monkeypatch):
-    baseline = client.get("/metrics").text
+    baseline = client.get("/metrics", headers=_metrics_headers()).text
 
     monkeypatch.setattr(
         agent_api,
@@ -219,9 +228,31 @@ def test_metrics_endpoint_tracks_budget_rejections(monkeypatch):
 
     assert response.status_code == 429
 
-    metrics = client.get("/metrics").text
+    metrics = client.get("/metrics", headers=_metrics_headers()).text
     assert _metric_value(
         metrics,
         "bobo_agent_budget_checks_total",
         {"outcome": "budget_exhausted"},
     ) >= _metric_value(baseline, "bobo_agent_budget_checks_total", {"outcome": "budget_exhausted"}) + 1
+
+
+def test_metrics_requires_internal_token_in_production(monkeypatch):
+    from app.core import config as config_module
+    from app import main as main_module
+
+    config_module.get_settings.cache_clear()
+    monkeypatch.setenv("ENV", "production")
+    monkeypatch.setenv("JWT_SECRET", "prod-secret-123")
+    monkeypatch.setenv("MCP_SERVICE_TOKEN", "prod-mcp-token-123")
+    monkeypatch.setenv("METRICS_ACCESS_TOKEN", "prod-metrics-token")
+
+    test_app = main_module.create_app()
+    prod_client = TestClient(test_app)
+
+    unauthorized = prod_client.get("/metrics")
+    authorized = prod_client.get("/metrics", headers={"Authorization": "Bearer prod-metrics-token"})
+
+    assert unauthorized.status_code == 401
+    assert authorized.status_code == 200
+
+    config_module.get_settings.cache_clear()

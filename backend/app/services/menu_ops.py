@@ -8,7 +8,9 @@ import psycopg
 from psycopg.rows import dict_row
 
 from app.core.config import get_settings, to_psycopg_conninfo
+from app.services.menu_search import invalidate_menu_search_cache
 from app.services.qdrant import QdrantService
+from app.services.menu_typing import infer_menu_taxonomy
 
 
 class MenuActionError(ValueError):
@@ -59,19 +61,35 @@ class MenuOpsService:
         description = item.get("description")
         sugar_opts = item.get("sugar_opts") or []
         ice_opts = item.get("ice_opts") or []
+        taxonomy = infer_menu_taxonomy({"name": name, "description": description})
 
         sql = """
-        INSERT INTO menu (brand, name, size, price, description, sugar_opts, ice_opts, is_active)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, TRUE)
-        RETURNING id::text AS id, brand, name, size, price, description, is_active
+        INSERT INTO menu (brand, name, size, price, description, item_type, drink_category, sugar_opts, ice_opts, is_active)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, TRUE)
+        RETURNING id::text AS id, brand, name, size, price, description, item_type, drink_category, is_active
         """
         with psycopg.connect(_db_url(), row_factory=dict_row) as conn, conn.cursor() as cur:
-            cur.execute(sql, (brand, name, size, price, description, sugar_opts, ice_opts))
+            cur.execute(
+                sql,
+                (
+                    brand,
+                    name,
+                    size,
+                    price,
+                    description,
+                    taxonomy["item_type"],
+                    taxonomy["drink_category"],
+                    sugar_opts,
+                    ice_opts,
+                ),
+            )
             row = cur.fetchone()
             conn.commit()
 
         if not row:
             raise MenuActionError("failed to create menu item")
+
+        invalidate_menu_search_cache()
 
         warnings: list[str] = []
         vector_updated = False
@@ -83,6 +101,8 @@ class MenuOpsService:
                 price=_to_float(row.get("price")) or 0.0,
                 size=row.get("size") or "",
                 description=row.get("description"),
+                item_type=row.get("item_type"),
+                drink_category=row.get("drink_category"),
                 is_active=bool(row.get("is_active", True)),
             )
             vector_updated = True
@@ -103,6 +123,8 @@ class MenuOpsService:
                 "size": row.get("size"),
                 "price": _to_float(row.get("price")),
                 "description": row.get("description"),
+                "item_type": row.get("item_type"),
+                "drink_category": row.get("drink_category"),
                 "is_active": bool(row.get("is_active", True)),
             },
         }
@@ -118,6 +140,8 @@ class MenuOpsService:
             "size",
             "price",
             "description",
+            "item_type",
+            "drink_category",
             "sugar_opts",
             "ice_opts",
             "is_active",
@@ -125,6 +149,15 @@ class MenuOpsService:
         fields = {k: v for k, v in item.items() if k in updatable}
         if not fields:
             raise MenuActionError("update requires at least one updatable field")
+        if "name" in fields or "description" in fields:
+            taxonomy = infer_menu_taxonomy(
+                {
+                    "name": fields.get("name") or item.get("name") or "",
+                    "description": fields.get("description") if "description" in fields else item.get("description"),
+                }
+            )
+            fields["item_type"] = fields.get("item_type") or taxonomy["item_type"]
+            fields["drink_category"] = fields.get("drink_category") or taxonomy["drink_category"]
 
         updates: list[str] = []
         values: list[Any] = []
@@ -137,7 +170,7 @@ class MenuOpsService:
         UPDATE menu
         SET {", ".join(updates)}, updated_at = NOW()
         WHERE id = %s
-        RETURNING id::text AS id, brand, name, size, price, description, is_active
+        RETURNING id::text AS id, brand, name, size, price, description, item_type, drink_category, is_active
         """
         with psycopg.connect(_db_url(), row_factory=dict_row) as conn, conn.cursor() as cur:
             cur.execute(sql, tuple(values))
@@ -146,6 +179,8 @@ class MenuOpsService:
 
         if not row:
             raise MenuActionError("menu not found")
+
+        invalidate_menu_search_cache()
 
         warnings: list[str] = []
         vector_updated = False
@@ -158,6 +193,8 @@ class MenuOpsService:
                     price=_to_float(row.get("price")) or 0.0,
                     size=row.get("size") or "",
                     description=row.get("description"),
+                    item_type=row.get("item_type"),
+                    drink_category=row.get("drink_category"),
                     is_active=True,
                 )
             else:
@@ -180,6 +217,8 @@ class MenuOpsService:
                 "size": row.get("size"),
                 "price": _to_float(row.get("price")),
                 "description": row.get("description"),
+                "item_type": row.get("item_type"),
+                "drink_category": row.get("drink_category"),
                 "is_active": bool(row.get("is_active", True)),
             },
         }
@@ -197,6 +236,8 @@ class MenuOpsService:
 
         if not row:
             raise MenuActionError("menu not found")
+
+        invalidate_menu_search_cache()
 
         warnings: list[str] = []
         vector_updated = False

@@ -271,10 +271,23 @@ export default function AiScreen() {
 
   const profileHighlights = useMemo(() => summarizeProfile(memoryProfile), [memoryProfile]);
   const portraitRows = useMemo(() => summarizePortrait(memoryProfile), [memoryProfile]);
-  const memoryHighlights = useMemo(
-    () => memoryItems.map((memory) => memory.content).filter(Boolean).slice(0, MEMORY_PREVIEW_LIMIT),
-    [memoryItems]
-  );
+  const memoryHighlights = useMemo(() => {
+    const seenContents = new Set<string>();
+
+    return memoryItems
+      .map((memory) => ({
+        id: memory.id,
+        content: memory.content.trim(),
+      }))
+      .filter((memory) => {
+        if (!memory.content || seenContents.has(memory.content)) {
+          return false;
+        }
+        seenContents.add(memory.content);
+        return true;
+      })
+      .slice(0, MEMORY_PREVIEW_LIMIT);
+  }, [memoryItems]);
 
   const composerBottomOffset = keyboardHeight > 0 ? Math.max(12, keyboardHeight - insets.bottom + 8) : FLOATING_TAB_BAR_SPACE;
   const shimmerTranslate = shimmerProgress.interpolate({
@@ -956,9 +969,9 @@ export default function AiScreen() {
                 <View style={styles.memoryDetailList}>
                   {memoryHighlights.length ? (
                     memoryHighlights.map((item) => (
-                      <View key={item} style={styles.memoryNote}>
+                      <View key={item.id} style={styles.memoryNote}>
                         <View style={styles.memoryNoteDot} />
-                        <Text style={styles.memoryNoteText}>{item}</Text>
+                        <Text style={styles.memoryNoteText}>{item.content}</Text>
                       </View>
                     ))
                   ) : (

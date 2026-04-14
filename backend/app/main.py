@@ -28,10 +28,11 @@ from app.api.vision import router as vision_router    # 视觉识别接口
 # 其他内部模块
 from app.agent.graph import close_agent_runtime   # Agent 运行时清理函数
 from app.core.authz import normalize_capabilities, reset_auth_context, set_auth_context  # 权限管理
-from app.core.config import get_settings           # 获取配置对象（单例）
+from app.core.config import get_settings, is_production_env, resolve_memory_worker_mode          # 获取配置对象（单例）
 from app.core.logging import configure_logging, reset_log_context, set_log_context  # 日志上下文
 from app.core.security import decode_token         # JWT 解码函数
 from app.models.db import close_pool, init_pool    # 数据库连接池初始化/关闭
+from app.memory.jobs import MemoryJobWorker
 from app.observability import metrics_content_type, metrics_payload, observe_http_request  # Prometheus 指标
 from app.tools.mcp_server import create_mcp_server  # MCP 服务创建函数
 
@@ -67,12 +68,11 @@ def _is_mcp_service_token(token: str, settings) -> bool:
         True = 这是 MCP 内部调用，给予全部权限
         False = 这不是 MCP token，需要按普通用户 token 处理
     """
-    # 候选 token 集合（用集合是因为查找快，O(1)）
-    candidates = {f"{settings.jwt_secret}:mcp"}  # 默认：JWT密钥 + ":mcp" 拼接
-    
-    # 如果配置了专门的 MCP token，也加入候选
+    candidates = set()
     if settings.mcp_service_token:
         candidates.add(settings.mcp_service_token)
+    elif not is_production_env(settings.env):
+        candidates.add(f"{settings.jwt_secret}:mcp")
     
     # 判断传入的 token 是否在候选集合中
     return token in candidates
@@ -101,7 +101,7 @@ class JWTMiddleware(BaseHTTPMiddleware):
         "/bobo/auth/register",    # 注册接口
         "/bobo/auth/refresh",     # 刷新 token 接口
         "/bobo/health",           # 健康检查（给运维用的）
-        "/metrics",               # Prometheus 指标接口
+        "/metrics",               # Prometheus 指标接口（生产环境路由内再做内部鉴权）
         "/docs",                  # API 文档
         "/openapi.json",          # OpenAPI 规范文件
         "/redoc",                 # 另一种 API 文档风格
@@ -363,6 +363,7 @@ async def lifespan(app: FastAPI):
     # AsyncExitStack 用于管理多个异步上下文
     # 可以动态添加多个资源，退出时自动清理
     async with AsyncExitStack() as stack:
+        app.state.memory_worker = None
         
         # 如果 MCP 子应用有自己的生命周期，也启动它
         if mcp_container and mcp_container.http_app is not None:
@@ -379,6 +380,14 @@ async def lifespan(app: FastAPI):
 
         # ========== 启动阶段 ==========
         init_pool()  # 初始化数据库连接池
+        if resolve_memory_worker_mode(settings) == "embedded":
+            worker = MemoryJobWorker(
+                poll_interval_seconds=settings.memory_worker_poll_interval_seconds,
+                batch_size=settings.memory_worker_batch_size,
+                max_backoff_seconds=settings.memory_worker_max_backoff_seconds,
+            )
+            await worker.start()
+            app.state.memory_worker = worker
         logger.info(json.dumps({"event": "app_startup", "app_name": settings.app_name}, ensure_ascii=False))
         
         # yield 是分界线：这里暂停，应用开始运行
@@ -386,6 +395,9 @@ async def lifespan(app: FastAPI):
         yield
         
         # ========== 关闭阶段 ==========
+        worker = getattr(app.state, "memory_worker", None)
+        if worker is not None:
+            await worker.stop()
         await close_agent_runtime()  # 关闭 Agent 运行时
         close_pool()                  # 关闭数据库连接池
         logger.info(json.dumps({"event": "app_shutdown", "app_name": settings.app_name}, ensure_ascii=False))
@@ -417,7 +429,7 @@ def create_app() -> FastAPI:
     
     # 判断是否是生产环境
     # in 操作符检查元素是否在集合中
-    is_production = settings.env.lower() in {"prod", "production"}
+    is_production = is_production_env(settings.env)
     
     # 创建 MCP 服务容器
     mcp_container = create_mcp_server()
@@ -464,12 +476,17 @@ def create_app() -> FastAPI:
 
     # 注册 Prometheus 指标接口
     @app.get("/metrics")
-    def metrics() -> Response:
+    def metrics(request: Request) -> Response:
         """
         Prometheus 监控指标接口。
         
         返回 Prometheus 格式的指标数据，供 Grafana 抓取。
         """
+        if is_production:
+            provided = request.headers.get("Authorization", "")
+            expected = f"Bearer {settings.metrics_access_token}"
+            if not settings.metrics_access_token or provided != expected:
+                return Response(status_code=401)
         return Response(content=metrics_payload(), media_type=metrics_content_type())
 
     # 注册 6 个路由组

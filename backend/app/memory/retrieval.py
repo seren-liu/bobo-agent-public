@@ -292,13 +292,11 @@ def load_memory_context(user_id: str, thread_key: str, query: str) -> dict[str, 
     return build_memory_context_blocks(user_id, thread_key, query)
 
 
-def build_agent_prompt_context(
+def _build_agent_prompt_context_v1(
     user_id: str,
     thread_key: str,
     recent_messages: list[Any],
-    *,
-    include_metadata: bool = False,
-) -> list[tuple[str, str]] | dict[str, Any]:
+) -> tuple[list[tuple[str, str]], dict[str, Any]]:
     latest_user_text = ""
     for message in reversed(recent_messages):
         if isinstance(message, tuple) and len(message) >= 2 and message[0] == "user":
@@ -324,14 +322,37 @@ def build_agent_prompt_context(
         memory_lines = _dedupe_texts(memory_lines)
         prompts.append(("system", "相关长期记忆：\n" + "\n".join(memory_lines)))
 
-    budgeted_prompts, diagnostics = _budget_prompt_sections(
+    return _budget_prompt_sections(
         prompts,
         total_char_budget=_budget_int("BOBO_MEMORY_PROMPT_MAX_CHARS", _DEFAULT_MEMORY_PROMPT_MAX_CHARS),
     )
+
+
+_CONTEXT_BUILDERS = {
+    "bobo-agent-memory-context.v1": _build_agent_prompt_context_v1,
+}
+
+
+def build_agent_prompt_context(
+    user_id: str,
+    thread_key: str,
+    recent_messages: list[Any],
+    *,
+    version: str | None = None,
+    include_metadata: bool = False,
+) -> list[tuple[str, str]] | dict[str, Any]:
+    selected_version = (version or get_settings().agent_memory_context_version or "bobo-agent-memory-context.v1").strip()
+    builder = _CONTEXT_BUILDERS.get(selected_version)
+    if builder is None:
+        selected_version = "bobo-agent-memory-context.v1"
+        builder = _CONTEXT_BUILDERS[selected_version]
+
+    budgeted_prompts, diagnostics = builder(user_id, thread_key, recent_messages)
     if include_metadata:
         return {
             "prompts": budgeted_prompts,
             "diagnostics": diagnostics,
             "rendered_text": "\n".join(content for _, content in budgeted_prompts),
+            "context_version": selected_version,
         }
     return budgeted_prompts

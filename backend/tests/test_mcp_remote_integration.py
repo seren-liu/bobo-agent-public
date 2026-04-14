@@ -86,11 +86,11 @@ async def _call_remote_tool(url: str, headers: dict[str, str], tool_name: str, p
 
 
 def test_remote_mcp_search_menu_roundtrip_with_service_token(remote_mcp_url):
-    class _FakeQdrantService:
-        async def search(self, query, brand=None, top_k=5):
+    class _FakeSearchService:
+        async def search(self, query, brand=None, top_k=5, source="pytest"):
             return [{"id": "m1", "brand": brand or "喜茶", "name": "多肉葡萄", "score": 0.99}]
 
-    with patch("app.tooling.operations.QdrantService", lambda: _FakeQdrantService()):
+    with patch("app.tooling.operations.get_menu_search_service", lambda: _FakeSearchService()):
         blocks = asyncio.run(
             _call_remote_tool(
                 remote_mcp_url,
@@ -106,13 +106,13 @@ def test_remote_mcp_search_menu_roundtrip_with_service_token(remote_mcp_url):
 
 
 def test_remote_mcp_search_menu_uses_user_token_identity(remote_mcp_url):
-    class _FakeQdrantService:
-        async def search(self, query, brand=None, top_k=5):
+    class _FakeSearchService:
+        async def search(self, query, brand=None, top_k=5, source="pytest"):
             return [{"id": "m2", "brand": brand or "喜茶", "name": "芝芝莓莓", "score": 0.95}]
 
     access_token = create_access_token("u-user")
 
-    with patch("app.tooling.operations.QdrantService", lambda: _FakeQdrantService()):
+    with patch("app.tooling.operations.get_menu_search_service", lambda: _FakeSearchService()):
         blocks = asyncio.run(
             _call_remote_tool(
                 remote_mcp_url,

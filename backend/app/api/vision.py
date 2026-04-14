@@ -7,6 +7,7 @@ from fastapi import APIRouter, HTTPException, Request
 
 from app.models.vision import RecognizeRequest, UploadURLRequest, UploadURLResponse, VisionResult
 from app.observability import observe_vision_request
+from app.core.rate_limit import enforce_rate_limit
 from app.services.cos import COSService
 from app.services.vision import VisionService
 
@@ -21,6 +22,8 @@ _vision_service = VisionService()
 def get_upload_url(payload: UploadURLRequest, request: Request) -> UploadURLResponse:
     request_id = getattr(request.state, "request_id", None)
     user_id = getattr(request.state, "user_id", "") or "anonymous"
+    client_ip = getattr(getattr(request, "client", None), "host", "unknown")
+    enforce_rate_limit(scope="vision:upload:user", key=f"{user_id}:{client_ip}", max_requests=30, window_seconds=60)
     logger.info(
         json.dumps(
             {
@@ -56,6 +59,9 @@ def get_upload_url(payload: UploadURLRequest, request: Request) -> UploadURLResp
 @router.post("/bobo/vision/recognize", response_model=VisionResult)
 def recognize(payload: RecognizeRequest, request: Request) -> VisionResult:
     request_id = getattr(request.state, "request_id", None)
+    user_id = getattr(request.state, "user_id", "") or "anonymous"
+    client_ip = getattr(getattr(request, "client", None), "host", "unknown")
+    enforce_rate_limit(scope="vision:recognize:user", key=f"{user_id}:{client_ip}", max_requests=20, window_seconds=60)
     logger.info(
         json.dumps(
             {
@@ -67,6 +73,10 @@ def recognize(payload: RecognizeRequest, request: Request) -> VisionResult:
             default=str,
         )
     )
+    try:
+        _cos_service.validate_user_file_url(payload.image_url, user_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     # Generate a presigned read URL so the vision model can access private COS objects
     readable_url = _cos_service.get_presigned_read_url(payload.image_url)
 

@@ -6,6 +6,8 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
+from app.services.menu_typing import infer_menu_taxonomy
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Import normalized menu JSON into PostgreSQL menu table.")
@@ -106,6 +108,7 @@ def load_items(path: Path, brand_override: str) -> list[dict[str, Any]]:
             "ice_opts": ice_opts,
             "is_active": is_active,
         }
+        item.update(infer_menu_taxonomy(item))
         items.append(item)
 
     return items
@@ -189,6 +192,8 @@ def import_items(items: list[dict[str, Any]], upsert_key: str, dry_run: bool) ->
                         size = %s,
                         price = %s,
                         description = %s,
+                        item_type = %s,
+                        drink_category = %s,
                         sugar_opts = %s,
                         ice_opts = %s,
                         is_active = %s,
@@ -201,6 +206,8 @@ def import_items(items: list[dict[str, Any]], upsert_key: str, dry_run: bool) ->
                         item.get("size"),
                         item.get("price"),
                         item.get("description"),
+                        item.get("item_type"),
+                        item.get("drink_category"),
                         item.get("sugar_opts") or [],
                         item.get("ice_opts") or [],
                         item.get("is_active", True),
@@ -211,8 +218,8 @@ def import_items(items: list[dict[str, Any]], upsert_key: str, dry_run: bool) ->
             else:
                 cur.execute(
                     """
-                    INSERT INTO menu (brand, name, size, price, description, sugar_opts, ice_opts, is_active)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    INSERT INTO menu (brand, name, size, price, description, item_type, drink_category, sugar_opts, ice_opts, is_active)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     (
                         item["brand"],
@@ -220,6 +227,8 @@ def import_items(items: list[dict[str, Any]], upsert_key: str, dry_run: bool) ->
                         item.get("size"),
                         item.get("price"),
                         item.get("description"),
+                        item.get("item_type"),
+                        item.get("drink_category"),
                         item.get("sugar_opts") or [],
                         item.get("ice_opts") or [],
                         item.get("is_active", True),

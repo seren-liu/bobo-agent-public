@@ -310,3 +310,144 @@ def test_search_degrades_to_keyword_only_when_sparse_has_no_hits():
     assert [item["id"] for item in results] == ["k1"]
     assert results[0]["score"] > 0
     assert results[0]["sparse_score"] == 0.0
+
+
+def test_search_prefers_refreshing_fruit_tea_and_penalizes_snacks():
+    embedding = FakeEmbeddingService()
+    models = FakeModels()
+    client = FakeQdrantClient()
+
+    async def _dense_search(**kwargs):
+        client.last_filter = kwargs["query_filter"]
+        return [
+            SimpleNamespace(
+                id="snack-1",
+                score=0.95,
+                payload={
+                    "id": "snack-1",
+                    "brand": "蜜雪冰城",
+                    "name": "雪王薯薯片-番茄味",
+                    "size": "",
+                    "price": 2.0,
+                    "description": "搭配果茶，开启休憩美妙时光",
+                    "is_active": True,
+                },
+            ),
+            SimpleNamespace(
+                id="tea-1",
+                score=0.81,
+                payload={
+                    "id": "tea-1",
+                    "brand": "喜茶",
+                    "name": "清爽芭乐提",
+                    "size": "",
+                    "price": 19.0,
+                    "description": "清爽鲜果茶，果香明显",
+                    "is_active": True,
+                },
+            ),
+        ]
+
+    client.search = _dense_search
+    service = QdrantService(
+        client=client,
+        models=models,
+        embedding_service=embedding,
+        sparse_document_provider=lambda **kwargs: [
+            {
+                "id": "snack-1",
+                "brand": "蜜雪冰城",
+                "name": "雪王薯薯片-番茄味",
+                "size": "",
+                "price": 2.0,
+                "description": "搭配果茶，开启休憩美妙时光",
+            },
+            {
+                "id": "tea-1",
+                "brand": "喜茶",
+                "name": "清爽芭乐提",
+                "size": "",
+                "price": 19.0,
+                "description": "清爽鲜果茶，果香明显",
+            },
+            {
+                "id": "milk-1",
+                "brand": "1点点",
+                "name": "椰果奶茶",
+                "size": "",
+                "price": 12.0,
+                "description": "清爽不腻，但属于奶茶",
+            },
+        ],
+    )
+
+    results = asyncio.run(service.search(query="清爽的水果茶", brand=None, top_k=3))
+
+    assert results[0]["id"] == "tea-1"
+    assert "薯片" not in [item["name"] for item in results[:2]]
+
+
+def test_search_penalizes_packaged_goods_for_drink_query():
+    embedding = FakeEmbeddingService()
+    models = FakeModels()
+    client = FakeQdrantClient()
+
+    async def _dense_search(**kwargs):
+        client.last_filter = kwargs["query_filter"]
+        return [
+            SimpleNamespace(
+                id="pack-1",
+                score=0.96,
+                payload={
+                    "id": "pack-1",
+                    "brand": "蜜雪冰城",
+                    "name": "酒酿风味花果茶",
+                    "size": "",
+                    "price": 12.9,
+                    "description": "净含量 27.5g/盒，保质期12个月",
+                    "is_active": True,
+                },
+            ),
+            SimpleNamespace(
+                id="fresh-1",
+                score=0.82,
+                payload={
+                    "id": "fresh-1",
+                    "brand": "喜茶",
+                    "name": "清爽芭乐提",
+                    "size": "",
+                    "price": 19.0,
+                    "description": "清爽鲜果茶，现制果香明显",
+                    "is_active": True,
+                },
+            ),
+        ]
+
+    client.search = _dense_search
+    service = QdrantService(
+        client=client,
+        models=models,
+        embedding_service=embedding,
+        sparse_document_provider=lambda **kwargs: [
+            {
+                "id": "pack-1",
+                "brand": "蜜雪冰城",
+                "name": "酒酿风味花果茶",
+                "size": "",
+                "price": 12.9,
+                "description": "净含量 27.5g/盒，保质期12个月",
+            },
+            {
+                "id": "fresh-1",
+                "brand": "喜茶",
+                "name": "清爽芭乐提",
+                "size": "",
+                "price": 19.0,
+                "description": "清爽鲜果茶，现制果香明显",
+            },
+        ],
+    )
+
+    results = asyncio.run(service.search(query="清爽的水果茶", brand=None, top_k=2))
+
+    assert results[0]["id"] == "fresh-1"

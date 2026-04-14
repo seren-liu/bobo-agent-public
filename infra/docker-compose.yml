@@ -45,6 +45,8 @@ services:
       dockerfile: Dockerfile
     restart: unless-stopped
     env_file: ../.env
+    environment:
+      MEMORY_WORKER_MODE: external
     ports:
       - "127.0.0.1:${BACKEND_BLUE_PORT:-18001}:8000"
     depends_on:
@@ -71,6 +73,8 @@ services:
       dockerfile: Dockerfile
     restart: unless-stopped
     env_file: ../.env
+    environment:
+      MEMORY_WORKER_MODE: external
     ports:
       - "127.0.0.1:${BACKEND_GREEN_PORT:-18002}:8000"
     depends_on:
@@ -102,6 +106,26 @@ services:
       - /etc/letsencrypt:/etc/letsencrypt:ro
       - /var/www/certbot:/var/www/certbot
       - ../web/dist:/usr/share/nginx/html
+
+  memory_worker:
+    image: ${BACKEND_BLUE_IMAGE:-bobo-backend:blue}
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file: ../.env
+    command: ["python", "-m", "app.memory.worker"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ../backend:/app
+    security_opt:
+      - no-new-privileges:true
 
   prometheus:
     image: prom/prometheus:v3.5.0

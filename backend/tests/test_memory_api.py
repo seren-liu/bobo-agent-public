@@ -65,6 +65,19 @@ def test_thread_profile_and_memory_flow():
     assert len(messages_resp.json()) >= 2
 
 
+def test_create_thread_rewrites_cross_user_prefix():
+    headers = _auth_header("u-thread-owner")
+
+    response = client.post(
+        "/bobo/agent/threads",
+        json={"thread_key": "user-u-victim:session-shared", "title": "测试会话"},
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["thread_key"] == "user-u-thread-owner:session-shared"
+
+
 def test_internal_extract_preview_and_reconcile(monkeypatch):
     headers = _auth_header("u-memory-preview")
 

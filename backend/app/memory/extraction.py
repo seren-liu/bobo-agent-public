@@ -104,6 +104,25 @@ _STRUCTURED_INTENT_HINTS = (
     "别超过",
 )
 
+_TEMPORARY_PREFERENCE_HINTS = (
+    "想喝",
+    "想来点",
+    "想试试",
+    "喝点",
+    "喝些",
+)
+
+_CATEGORY_VALUE_MAP = {
+    "果茶": "fruit_tea",
+    "水果茶": "fruit_tea",
+    "鲜果茶": "fruit_tea",
+    "奶茶": "milk_tea",
+    "轻乳茶": "light_milk_tea",
+    "纯茶": "pure_tea",
+    "柠檬茶": "lemon_tea",
+    "咖啡": "coffee",
+}
+
 
 def _ttl(days: int | None = None) -> datetime:
     """计算记忆项的过期时间（TTL）。
@@ -349,6 +368,44 @@ def _extract_drink_facts(content: str, message: dict[str, Any], thread_key: str)
     return facts
 
 
+def _extract_temporary_category_preference_facts(content: str, message: dict[str, Any], thread_key: str) -> list[dict[str, Any]]:
+    """提取阶段性饮品品类偏好事实。
+
+    适配「这段时间我想喝果茶类」这类明确带时间范围的短期偏好，
+    优先写入 memory item，而不是长期 profile。
+    """
+    if not _contains_any(content, _TEMPORARY_BUDGET_HINTS):
+        return []
+    if not _contains_any(content, _TEMPORARY_PREFERENCE_HINTS):
+        return []
+
+    matched_label = next((label for label in _CATEGORY_VALUE_MAP if label in content), None)
+    if not matched_label:
+        return []
+
+    normalized_value = _CATEGORY_VALUE_MAP[matched_label]
+    return [
+        _build_fact(
+            fact_type="drink_preference",
+            route="memory",
+            scope="memory",
+            memory_type="preference",
+            memory_scope="recommendation",
+            content=f"近期更想喝{matched_label}类饮品",
+            normalized_fact={
+                "kind": "drink_preference",
+                "field": "preferred_categories",
+                "value": [normalized_value],
+                "time_scope": "recent",
+            },
+            confidence=0.9,
+            ttl_days=30,
+            source_message=message,
+            source_ref=thread_key,
+        )
+    ]
+
+
 def _extract_budget_facts(content: str, message: dict[str, Any], thread_key: str) -> list[dict[str, Any]]:
     """提取预算偏好或约束事实。
 
@@ -472,6 +529,7 @@ def extract_rule_based_facts(messages: list[dict[str, Any]], thread_key: str) ->
         # 依次提取各类偏好
         facts.extend(_extract_reply_style_facts(content, message, thread_key))
         facts.extend(_extract_drink_facts(content, message, thread_key))
+        facts.extend(_extract_temporary_category_preference_facts(content, message, thread_key))
         facts.extend(_extract_budget_facts(content, message, thread_key))
     return facts
 

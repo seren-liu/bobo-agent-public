@@ -17,9 +17,11 @@ from starlette.responses import StreamingResponse
 from app.agent.graph import stream_agent_events
 from app.agent.state import audit_agent_event
 from app.core.brands import canonicalize_brand_name, known_brand_names
-from app.memory.jobs import enqueue_memory_job, schedule_memory_jobs
+from app.core.rate_limit import enforce_rate_limit
+from app.core.threads import normalize_session_thread_id
+from app.memory.jobs import enqueue_memory_job
 from app.memory import repository
-from app.observability import observe_agent_budget_check, observe_agent_chat, observe_agent_first_token, observe_agent_tool_call
+from app.observability import observe_agent_budget_check, observe_agent_chat, observe_agent_first_token, observe_agent_tool_call, observe_fast_path, observe_task_execution
 from app.services.llm_budget import (
     affordable_output_tokens,
     cost_cny_for_tokens,
@@ -348,7 +350,8 @@ async def _retrieve_menu_fast_path(
             result_sets.append(list(payload.get("results") or []))
 
     merged_results = _merge_menu_results(result_sets, query, max_price)
-    brand_coverage = get_menu_brand_coverage_impl(
+    brand_coverage = await asyncio.to_thread(
+        get_menu_brand_coverage_impl,
         brand=brand,
         user_id=user_id,
         request_id=request_id,
@@ -634,7 +637,7 @@ def _is_simple_menu_request(message: str) -> bool:
     返回:
         如果消息符合菜单快速路径处理条件则返回 True。
     """
-    return any(token in message for token in ("推荐", "喝什么", "想喝", "找")) and _extract_brand(message) is not None and _extract_menu_query(message) is not None
+    return any(token in message for token in ("推荐", "喝什么", "想喝", "找", "有什么", "有啥", "哪款", "热门", "人气", "top")) and _extract_brand(message) is not None and _extract_menu_query(message) is not None
 
 
 def _detect_stats_period(message: str) -> str | None:
@@ -668,7 +671,7 @@ def _is_simple_stats_request(message: str) -> bool:
     返回:
         如果消息符合统计快速路径处理条件则返回 True。
     """
-    return _detect_stats_period(message) is not None and any(token in message for token in ("多少杯", "几杯", "花了多少", "总花费", "消费"))
+    return _detect_stats_period(message) is not None and any(token in message for token in ("多少杯", "几杯", "喝了几次", "花了多少", "花多少钱", "总花费", "消费"))
 
 
 def _render_stats_reply(period: str, stats: dict[str, Any]) -> str:
@@ -708,7 +711,7 @@ def _is_recent_records_request(message: str) -> bool:
     返回:
         如果消息询问最近饮品记录则返回 True。
     """
-    return any(token in message for token in ("最近喝了什么", "最近喝了啥", "我上次喝了什么", "最近几杯", "最近的记录", "最近一杯"))
+    return any(token in message for token in ("最近喝了什么", "最近喝了啥", "我上次喝了什么", "最近几杯", "最近的记录", "最近一杯", "最近一次喝了什么"))
 
 
 def _recent_records_limit_for_message(message: str) -> int:
@@ -787,7 +790,7 @@ def _is_day_records_request(message: str) -> bool:
     """
     if _detect_day_anchor(message) is None:
         return False
-    return any(token in message for token in ("喝了什么", "喝了啥", "喝的什么", "几杯", "多少杯", "花了多少", "消费", "记录"))
+    return any(token in message for token in ("喝了什么", "喝了啥", "喝的什么", "几杯", "多少杯", "花了多少", "花多少钱", "消费", "记录"))
 
 
 def _render_day_records_reply(day_label: str, payload: dict[str, Any], message: str) -> str:
@@ -923,10 +926,39 @@ async def _run_memory_jobs_after_response(user_id: str, thread_id: str) -> None:
         user_id: 记忆任务的用户标识符。
         thread_id: 会话线程标识符。
     """
-    enqueue_memory_job(user_id, "thread_summary_refresh", {"thread_key": thread_id}, thread_id)
-    enqueue_memory_job(user_id, "memory_extract_from_thread", {"thread_key": thread_id}, thread_id)
-    enqueue_memory_job(user_id, "profile_refresh_from_records", {}, thread_id)
-    schedule_memory_jobs(limit=10)
+    await asyncio.gather(
+        asyncio.to_thread(enqueue_memory_job, user_id, "thread_summary_refresh", {"thread_key": thread_id}, thread_id),
+        asyncio.to_thread(enqueue_memory_job, user_id, "memory_extract_from_thread", {"thread_key": thread_id}, thread_id),
+        asyncio.to_thread(enqueue_memory_job, user_id, "profile_refresh_from_records", {}, thread_id),
+    )
+
+
+async def _daily_budget_snapshot_async(*, user_id: str, model: str) -> dict[str, Any]:
+    return await asyncio.to_thread(_daily_budget_snapshot, user_id=user_id, model=model)
+
+
+async def _create_thread_async(user_id: str, thread_id: str) -> dict[str, Any]:
+    return await asyncio.to_thread(repository.create_thread, user_id, thread_id)
+
+
+async def _append_message_async(**kwargs: Any) -> dict[str, Any]:
+    return await asyncio.to_thread(repository.append_message, **kwargs)
+
+
+async def _record_usage_async(**kwargs: Any) -> dict[str, Any] | None:
+    return await asyncio.to_thread(record_usage, **kwargs)
+
+
+async def _get_stats_async(**kwargs: Any) -> dict[str, Any]:
+    return await asyncio.to_thread(get_stats_impl, **kwargs)
+
+
+async def _get_recent_records_async(**kwargs: Any) -> dict[str, Any]:
+    return await asyncio.to_thread(get_recent_records_impl, **kwargs)
+
+
+async def _get_day_async(**kwargs: Any) -> dict[str, Any]:
+    return await asyncio.to_thread(get_day_impl, **kwargs)
 
 
 def _format_sse(payload: dict[str, Any], *, event: str | None = None, event_id: str | None = None) -> str:
@@ -993,12 +1025,7 @@ def _session_thread_id(user_id: str, session_id: str) -> str:
     返回:
         'user-xxx:session-yyy' 格式的标准线程 ID。
     """
-    clean = session_id.strip()
-    if clean.startswith("user-") and ":session-" in clean:
-        return clean
-    if clean.startswith("session-"):
-        clean = clean[len("session-") :]
-    return f"user-{user_id}:session-{clean}"
+    return normalize_session_thread_id(user_id, session_id)
 
 
 @router.post("/chat")
@@ -1040,6 +1067,8 @@ async def chat(payload: ChatRequest, request: Request) -> StreamingResponse:
     if not request_user_id:
         raise HTTPException(status_code=401, detail="missing authenticated user")
     user_id = request_user_id
+    client_ip = getattr(getattr(request, "client", None), "host", "unknown")
+    enforce_rate_limit(scope="agent:chat:user", key=f"{user_id}:{client_ip}", max_requests=30, window_seconds=60)
     request_id = (
         getattr(request.state, "request_id", None)
         or request.headers.get("X-Request-ID")
@@ -1049,7 +1078,7 @@ async def chat(payload: ChatRequest, request: Request) -> StreamingResponse:
     thread_id = _session_thread_id(user_id, payload.thread_id)
     request_start = time.perf_counter()
     chat_model = _chat_model()
-    budget_snapshot = _daily_budget_snapshot(user_id=user_id, model=chat_model)
+    budget_snapshot = await _daily_budget_snapshot_async(user_id=user_id, model=chat_model)
     reserve = _message_budget_reserve(user_message=payload.message, chat_model=chat_model)
     available_output_tokens = _available_output_tokens_after_reserve(snapshot=budget_snapshot, reserve=reserve)
     if budget_snapshot["remaining_cny"] <= 0:
@@ -1096,8 +1125,8 @@ async def chat(payload: ChatRequest, request: Request) -> StreamingResponse:
         request_id=request_id,
         message_len=len(payload.message),
     )
-    repository.create_thread(user_id, thread_id)
-    repository.append_message(
+    await _create_thread_async(user_id, thread_id)
+    await _append_message_async(
         user_id=user_id,
         thread_key=thread_id,
         role="user",
@@ -1149,6 +1178,7 @@ async def chat(payload: ChatRequest, request: Request) -> StreamingResponse:
                 max_price = _extract_budget_ceiling(payload.message)
                 if brand and query:
                     active_mode = "menu_fast_path"
+                    observe_fast_path(path=active_mode, outcome="selected")
                     _log_phase(
                         request_id,
                         "fast_path_selected",
@@ -1196,7 +1226,7 @@ async def chat(payload: ChatRequest, request: Request) -> StreamingResponse:
                         event="tool_result",
                         event_id=request_id,
                     )
-                    repository.append_message(
+                    await _append_message_async(
                         user_id=user_id,
                         thread_key=thread_id,
                         role="tool",
@@ -1236,7 +1266,7 @@ async def chat(payload: ChatRequest, request: Request) -> StreamingResponse:
                         event_id=request_id,
                     )
                     _record_first_token(active_mode)
-                    repository.append_message(
+                    await _append_message_async(
                         user_id=user_id,
                         thread_key=thread_id,
                         role="assistant",
@@ -1245,7 +1275,7 @@ async def chat(payload: ChatRequest, request: Request) -> StreamingResponse:
                         source="agent_fast_path",
                     )
                     if llm_usage_tokens:
-                        record_usage(
+                        await _record_usage_async(
                             user_id=user_id,
                             model=_chat_model(),
                             input_tokens=llm_usage_tokens[0],
@@ -1268,10 +1298,13 @@ async def chat(payload: ChatRequest, request: Request) -> StreamingResponse:
                         mode="fast_path",
                     )
                     observe_agent_chat(mode=active_mode, outcome="success", duration_seconds=time.perf_counter() - request_start)
+                    observe_fast_path(path=active_mode, outcome="success")
+                    observe_task_execution(task=active_mode, outcome="success", source="agent")
                     return
 
             if _is_simple_stats_request(payload.message):
                 active_mode = "stats_fast_path"
+                observe_fast_path(path=active_mode, outcome="selected")
                 period = _detect_stats_period(payload.message) or "all"
                 _log_phase(
                     request_id,
@@ -1279,7 +1312,7 @@ async def chat(payload: ChatRequest, request: Request) -> StreamingResponse:
                     elapsed_ms=round((time.perf_counter() - request_start) * 1000, 2),
                     period=period,
                 )
-                stats = get_stats_impl(
+                stats = await _get_stats_async(
                     period=period,
                     date=None,
                     user_id=user_id,
@@ -1294,7 +1327,7 @@ async def chat(payload: ChatRequest, request: Request) -> StreamingResponse:
                     event_id=request_id,
                 )
                 _record_first_token(active_mode)
-                repository.append_message(
+                await _append_message_async(
                     user_id=user_id,
                     thread_key=thread_id,
                     role="assistant",
@@ -1319,10 +1352,13 @@ async def chat(payload: ChatRequest, request: Request) -> StreamingResponse:
                     mode="stats_fast_path",
                 )
                 observe_agent_chat(mode=active_mode, outcome="success", duration_seconds=time.perf_counter() - request_start)
+                observe_fast_path(path=active_mode, outcome="success")
+                observe_task_execution(task=active_mode, outcome="success", source="agent")
                 return
 
             if _is_recent_records_request(payload.message):
                 active_mode = "recent_records_fast_path"
+                observe_fast_path(path=active_mode, outcome="selected")
                 recent_limit = _recent_records_limit_for_message(payload.message)
                 _log_phase(
                     request_id,
@@ -1330,7 +1366,7 @@ async def chat(payload: ChatRequest, request: Request) -> StreamingResponse:
                     elapsed_ms=round((time.perf_counter() - request_start) * 1000, 2),
                     limit=recent_limit,
                 )
-                payload_recent = get_recent_records_impl(
+                payload_recent = await _get_recent_records_async(
                     limit=recent_limit,
                     user_id=user_id,
                     request_id=request_id,
@@ -1345,7 +1381,7 @@ async def chat(payload: ChatRequest, request: Request) -> StreamingResponse:
                     event_id=request_id,
                 )
                 _record_first_token(active_mode)
-                repository.append_message(
+                await _append_message_async(
                     user_id=user_id,
                     thread_key=thread_id,
                     role="assistant",
@@ -1370,12 +1406,15 @@ async def chat(payload: ChatRequest, request: Request) -> StreamingResponse:
                     mode="recent_records_fast_path",
                 )
                 observe_agent_chat(mode=active_mode, outcome="success", duration_seconds=time.perf_counter() - request_start)
+                observe_fast_path(path=active_mode, outcome="success")
+                observe_task_execution(task=active_mode, outcome="success", source="agent")
                 return
 
             if _is_day_records_request(payload.message):
                 day_anchor = _detect_day_anchor(payload.message)
                 if day_anchor:
                     active_mode = "day_records_fast_path"
+                    observe_fast_path(path=active_mode, outcome="selected")
                     day_label, target_date = day_anchor
                     _log_phase(
                         request_id,
@@ -1383,7 +1422,7 @@ async def chat(payload: ChatRequest, request: Request) -> StreamingResponse:
                         elapsed_ms=round((time.perf_counter() - request_start) * 1000, 2),
                         date=target_date,
                     )
-                    payload_day = get_day_impl(
+                    payload_day = await _get_day_async(
                         date=target_date,
                         user_id=user_id,
                         request_id=request_id,
@@ -1397,7 +1436,7 @@ async def chat(payload: ChatRequest, request: Request) -> StreamingResponse:
                         event_id=request_id,
                     )
                     _record_first_token(active_mode)
-                    repository.append_message(
+                    await _append_message_async(
                         user_id=user_id,
                         thread_key=thread_id,
                         role="assistant",
@@ -1422,7 +1461,11 @@ async def chat(payload: ChatRequest, request: Request) -> StreamingResponse:
                         mode="day_records_fast_path",
                     )
                     observe_agent_chat(mode=active_mode, outcome="success", duration_seconds=time.perf_counter() - request_start)
+                    observe_fast_path(path=active_mode, outcome="success")
+                    observe_task_execution(task=active_mode, outcome="success", source="agent")
                     return
+
+            observe_fast_path(path="agent_graph", outcome="fallback")
 
             async for event in stream_agent_events(
                 message=payload.message,
@@ -1507,7 +1550,7 @@ async def chat(payload: ChatRequest, request: Request) -> StreamingResponse:
                         event="tool_result",
                         event_id=request_id,
                     )
-                    repository.append_message(
+                    await _append_message_async(
                         user_id=user_id,
                         thread_key=thread_id,
                         role="tool",
@@ -1519,7 +1562,7 @@ async def chat(payload: ChatRequest, request: Request) -> StreamingResponse:
                     )
             assistant_text = "".join(assistant_chunks).strip()
             if assistant_text:
-                repository.append_message(
+                await _append_message_async(
                     user_id=user_id,
                     thread_key=thread_id,
                     role="assistant",
@@ -1531,7 +1574,7 @@ async def chat(payload: ChatRequest, request: Request) -> StreamingResponse:
                 completion_tokens = (
                     usage_completion_tokens if usage_completion_tokens is not None else assistant_output_tokens_estimate or estimate_tokens(assistant_text)
                 )
-                record_usage(
+                await _record_usage_async(
                     user_id=user_id,
                     model=chat_model,
                     input_tokens=prompt_tokens,
@@ -1557,7 +1600,7 @@ async def chat(payload: ChatRequest, request: Request) -> StreamingResponse:
             observe_agent_chat(mode=active_mode, outcome="success", duration_seconds=time.perf_counter() - request_start)
         except RuntimeError as exc:
             if assistant_chunks:
-                repository.append_message(
+                await _append_message_async(
                     user_id=user_id,
                     thread_key=thread_id,
                     role="assistant",
@@ -1582,7 +1625,7 @@ async def chat(payload: ChatRequest, request: Request) -> StreamingResponse:
             observe_agent_chat(mode=active_mode, outcome="runtime_error", duration_seconds=time.perf_counter() - request_start)
         except Exception as exc:
             if assistant_chunks:
-                repository.append_message(
+                await _append_message_async(
                     user_id=user_id,
                     thread_key=thread_id,
                     role="assistant",

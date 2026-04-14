@@ -1,0 +1,263 @@
+{
+  "schema_version": "bobo-agent-business-eval.v1",
+  "suite_name": "Bobo Agent Business Core Eval",
+  "cases": [
+    {
+      "id": "chat.menu_fast_path_local",
+      "kind": "chat",
+      "user_id": "u-eval-menu-local",
+      "thread_id": "eval-menu-local",
+      "message": "给我推荐古茗的经典奶茶top3",
+      "stubs": {
+        "search_menu_results": [
+          {
+            "brand": "古茗",
+            "query": "厚乳",
+            "results": [
+              {
+                "id": "g-1",
+                "brand": "古茗",
+                "name": "经典奶香奶茶",
+                "price": 12,
+                "description": "经典奶香，口感顺滑",
+                "score": 0.84
+              }
+            ]
+          }
+        ],
+        "brand_coverage": true
+      },
+      "assertions": {
+        "expected_status": 200,
+        "event_types_include": ["meta", "tool_call", "tool_result", "text", "done"],
+        "tools_include": ["search_menu"],
+        "text_contains_all": ["古茗可以先看这几款奶茶", "经典奶香奶茶"],
+        "call_expectations": {
+          "search_menu_impl": 5,
+          "stream_agent_events": 0
+        }
+      }
+    },
+    {
+      "id": "chat.menu_gap_fallback",
+      "kind": "chat",
+      "user_id": "u-eval-menu-gap",
+      "thread_id": "eval-menu-gap",
+      "message": "给我推荐霸王茶姬的果茶",
+      "stubs": {
+        "search_menu_results": [
+          {
+            "brand": null,
+            "query": "果茶",
+            "results": [
+              {
+                "id": "h-1",
+                "brand": "喜茶",
+                "name": "多肉葡萄",
+                "price": 19,
+                "description": "经典果茶",
+                "score": 0.63
+              }
+            ]
+          }
+        ],
+        "brand_coverage": false,
+        "unstructured_menu_reply": "如果你今天想喝霸王茶姬的果茶，可以先选清爽、茶感明显一点的方向。"
+      },
+      "assertions": {
+        "expected_status": 200,
+        "text_contains_all": ["霸王茶姬", "果茶"],
+        "call_expectations": {
+          "generate_unstructured_menu_reply": 0,
+          "stream_agent_events": 0
+        }
+      }
+    },
+    {
+      "id": "chat.stats_fast_path",
+      "kind": "chat",
+      "user_id": "u-eval-stats",
+      "thread_id": "eval-stats",
+      "message": "这周我喝了多少杯",
+      "stubs": {
+        "stats_payload": {
+          "total_amount": 58.0,
+          "total_count": 4,
+          "brand_dist": [{"brand": "一点点", "count": 2}],
+          "weekly_trend": [],
+          "sugar_pref": [],
+          "ice_pref": [],
+          "daily_density": {}
+        }
+      },
+      "assertions": {
+        "expected_status": 200,
+        "text_contains_all": ["这周你一共喝了 4 杯"],
+        "call_expectations": {
+          "get_stats_impl": 1,
+          "stream_agent_events": 0
+        }
+      }
+    },
+    {
+      "id": "chat.recent_fast_path",
+      "kind": "chat",
+      "user_id": "u-eval-recent",
+      "thread_id": "eval-recent",
+      "message": "我上次喝了什么",
+      "stubs": {
+        "recent_records_payload": [
+          {
+            "brand": "喜茶",
+            "name": "多肉葡萄",
+            "price": 19,
+            "consumed_at": "2026-04-04T12:00:00"
+          }
+        ]
+      },
+      "assertions": {
+        "expected_status": 200,
+        "text_contains_all": ["你最近一杯是 2026-04-04 的 喜茶 多肉葡萄，¥19。"],
+        "call_expectations": {
+          "get_recent_records_impl": 1,
+          "stream_agent_events": 0
+        }
+      }
+    },
+    {
+      "id": "chat.day_fast_path",
+      "kind": "chat",
+      "user_id": "u-eval-day",
+      "thread_id": "eval-day",
+      "message": "今天喝了什么",
+      "stubs": {
+        "day_records_payload": [
+          {
+            "brand": "喜茶",
+            "name": "多肉葡萄",
+            "price": 19
+          },
+          {
+            "brand": "一点点",
+            "name": "葡萄柚绿",
+            "price": 18
+          }
+        ]
+      },
+      "assertions": {
+        "expected_status": 200,
+        "text_contains_all": ["今天你喝了 2 杯", "喜茶 多肉葡萄", "一点点 葡萄柚绿"],
+        "call_expectations": {
+          "get_day_impl": 1,
+          "stream_agent_events": 0
+        }
+      }
+    },
+    {
+      "id": "chat.graph_tool_path",
+      "kind": "chat",
+      "user_id": "u-eval-graph",
+      "thread_id": "eval-graph",
+      "message": "帮我推荐一杯清爽一点、预算 20 元以内的饮品",
+      "stubs": {
+        "graph_events": [
+          {
+            "event": "on_tool_start",
+            "name": "search_menu",
+            "run_id": "tool-1",
+            "data": {
+              "input": {
+                "query": "清爽 20 元以内"
+              }
+            }
+          },
+          {
+            "event": "on_tool_end",
+            "name": "search_menu",
+            "run_id": "tool-1",
+            "data": {
+              "output": {
+                "results": [
+                  {
+                    "id": "m-1",
+                    "brand": "喜茶",
+                    "name": "多肉葡萄"
+                  }
+                ]
+              }
+            }
+          },
+          {
+            "event": "on_chat_model_stream",
+            "data": {
+              "chunk": {
+                "content": "可以先试试喜茶多肉葡萄，整体会比较清爽。"
+              }
+            }
+          },
+          {
+            "event": "on_chat_model_end",
+            "data": {
+              "output": {
+                "usage_metadata": {
+                  "input_tokens": 24,
+                  "output_tokens": 16
+                }
+              }
+            }
+          }
+        ]
+      },
+      "assertions": {
+        "expected_status": 200,
+        "event_types_include": ["meta", "tool_call", "tool_result", "text", "done"],
+        "tools_include": ["search_menu"],
+        "text_contains_all": ["喜茶多肉葡萄", "清爽"],
+        "call_expectations": {
+          "stream_agent_events": 1
+        }
+      }
+    },
+    {
+      "id": "memory.context_budgeted",
+      "kind": "memory_context",
+      "user_id": "u-eval-memory",
+      "thread_id": "eval-memory",
+      "message": "推荐便宜一点",
+      "setup": {
+        "profile": {
+          "drink_preferences": {
+            "default_sugar": "少糖",
+            "default_ice": "去冰",
+            "preferred_brands": ["喜茶", "古茗", "霸王茶姬"],
+            "preferred_categories": ["果茶", "奶茶"]
+          },
+          "interaction_preferences": {
+            "reply_style": "brief"
+          },
+          "budget_preferences": {
+            "soft_price_ceiling": 20,
+            "price_sensitive": true
+          }
+        },
+        "thread_summary": "最近在比较低糖果茶，最近在比较低糖果茶",
+        "memories": [
+          {
+            "content": "最近预算偏紧，推荐便宜一些"
+          },
+          {
+            "content": "最近预算偏紧，推荐便宜一些"
+          },
+          {
+            "content": "优先果茶，不要太甜"
+          }
+        ]
+      },
+      "assertions": {
+        "rendered_contains_all": ["用户长期画像", "回答风格：brief", "当前会话摘要", "相关长期记忆"],
+        "rendered_excludes_all": ["reply_style"],
+        "diagnostics_char_count_lte": 760
+      }
+    }
+  ]
+}

@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import AsyncGenerator
 from datetime import date
 from types import SimpleNamespace
+import json
 import sys
 import types
 import asyncio
@@ -12,9 +13,10 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.agent import nodes
-from app.agent.nodes import _record_drink_impl, _search_menu_impl, get_mcp_tools, llm_node, route_after_llm, route_after_tool
+from app.agent.nodes import _record_drink_impl, _search_menu_impl, get_mcp_tools, llm_node, route_after_llm, route_after_tool, tool_node
 from app.api import agent as agent_api
 from app.core.config import get_settings
+from app.core.rate_limit import clear_rate_limits
 from app.services import online_menu_search
 from app.tools.mcp_server import _guard_actor
 
@@ -51,6 +53,10 @@ def _build_client(user_id: str = "u-test") -> TestClient:
     return TestClient(app)
 
 
+def setup_function():
+    clear_rate_limits()
+
+
 def test_agent_chat_text_stream(monkeypatch):
     seen = {}
 
@@ -77,6 +83,10 @@ def test_agent_chat_text_stream(monkeypatch):
     assert seen["user_id"] == "u-test"
     assert seen["thread_id"] == "user-u-test:session-thread-1"
     assert seen["request_id"]
+
+
+def test_session_thread_id_rewrites_cross_user_prefix():
+    assert agent_api._session_thread_id("u-safe", "user-u-victim:session-shared") == "user-u-safe:session-shared"
 
 
 def test_agent_chat_tool_call_stream(monkeypatch):
@@ -125,6 +135,28 @@ def test_agent_chat_rejects_when_daily_budget_exhausted(monkeypatch):
 
     assert resp.status_code == 429
     assert "预算已用完" in resp.text
+
+
+def test_agent_chat_rate_limit(monkeypatch):
+    async def _fake_stream(**_kwargs) -> AsyncGenerator[dict, None]:
+        yield {"event": "on_chat_model_stream", "data": {"chunk": _FakeChunk("你好")}}
+
+    calls = {"count": 0}
+
+    def _fake_limit(**kwargs):
+        calls["count"] += 1
+        if calls["count"] > 1:
+            raise agent_api.HTTPException(status_code=429, detail="too many requests")
+
+    monkeypatch.setattr(agent_api, "enforce_rate_limit", _fake_limit)
+    monkeypatch.setattr(agent_api, "stream_agent_events", _fake_stream)
+    client = _build_client()
+
+    resp1 = client.post("/bobo/agent/chat", json={"message": "hi", "thread_id": "thread-rate-1"})
+    resp2 = client.post("/bobo/agent/chat", json={"message": "hi again", "thread_id": "thread-rate-2"})
+
+    assert resp1.status_code == 200
+    assert resp2.status_code == 429
 
 
 def test_agent_chat_records_daily_usage(monkeypatch):
@@ -602,13 +634,106 @@ def test_llm_node_with_mocked_qwen_response(monkeypatch):
     llm = _FakeLLM()
     runtime = {"llm": llm}
     state = {"messages": [("user", "今天喝了什么推荐")] , "max_steps": 10}
-    monkeypatch.setattr(nodes, "build_agent_prompt_context", lambda *args, **kwargs: {"prompts": [], "diagnostics": {}})
+    monkeypatch.setattr(
+        nodes,
+        "build_prompt_bundle",
+        lambda **kwargs: {
+            "system_prompt": "system",
+            "system_prompt_version": "bobo-agent-system.v1",
+            "context_version": "bobo-agent-memory-context.v1",
+            "memory_bundle": {"prompts": [], "diagnostics": {}, "context_version": "bobo-agent-memory-context.v1"},
+        },
+    )
 
     result = __import__("asyncio").run(llm_node(state, runtime))
 
     assert "messages" in result
     assert result["messages"][0].content == "这是模型回复"
     assert llm.last_messages[0][0] == "system"
+
+
+def test_llm_node_degrades_when_llm_times_out(monkeypatch):
+    class _SlowLLM:
+        async def ainvoke(self, _messages):
+            raise TimeoutError("llm timed out")
+
+    monkeypatch.setattr(
+        nodes,
+        "build_prompt_bundle",
+        lambda **kwargs: {
+            "system_prompt": "system",
+            "system_prompt_version": "bobo-agent-system.v1",
+            "context_version": "bobo-agent-memory-context.v1",
+            "memory_bundle": {"prompts": [], "diagnostics": {}, "context_version": "bobo-agent-memory-context.v1"},
+        },
+    )
+    get_settings.cache_clear()
+    monkeypatch.setenv("LLM_REQUEST_TIMEOUT_SECONDS", "0.01")
+
+    result = __import__("asyncio").run(llm_node({"messages": [("user", "推荐点喝的")], "max_steps": 10}, {"llm": _SlowLLM()}))
+
+    assert "推理服务" in result["messages"][0].content
+    get_settings.cache_clear()
+
+
+def test_tool_node_classifies_timeout_errors():
+    class _SlowTool:
+        name = "search_menu"
+
+        async def ainvoke(self, _args):
+            raise TimeoutError("tool timed out")
+
+    state = {
+        "user_id": "u1",
+        "max_steps": 3,
+        "messages": [_FakeMessage(tool_calls=[{"name": "search_menu", "args": {"query": "葡萄"}, "id": "tool-1"}])],
+    }
+
+    result = __import__("asyncio").run(tool_node(state, {"tool_lookup": {"search_menu": _SlowTool()}}))
+
+    payload = json.loads(result["messages"][0].content)
+    assert payload["error_category"] == "timeout"
+    assert payload["retryable"] is True
+
+
+def test_tool_node_rejects_invalid_input():
+    class _Tool:
+        name = "search_menu"
+
+        async def ainvoke(self, _args):
+            return {"results": [], "query": "x"}
+
+    state = {
+        "user_id": "u1",
+        "max_steps": 3,
+        "messages": [_FakeMessage(tool_calls=[{"name": "search_menu", "args": {}, "id": "tool-2"}])],
+    }
+
+    result = __import__("asyncio").run(tool_node(state, {"tool_lookup": {"search_menu": _Tool()}}))
+
+    payload = json.loads(result["messages"][0].content)
+    assert payload["error_category"] == "input_validation"
+    assert payload["retryable"] is False
+
+
+def test_tool_node_rejects_invalid_output():
+    class _Tool:
+        name = "search_menu"
+
+        async def ainvoke(self, _args):
+            return {"results": [{"id": "m1"}], "query": "葡萄"}
+
+    state = {
+        "user_id": "u1",
+        "max_steps": 3,
+        "messages": [_FakeMessage(tool_calls=[{"name": "search_menu", "args": {"query": "葡萄"}, "id": "tool-3"}])],
+    }
+
+    result = __import__("asyncio").run(tool_node(state, {"tool_lookup": {"search_menu": _Tool()}}))
+
+    payload = json.loads(result["messages"][0].content)
+    assert payload["error_category"] == "output_validation"
+    assert payload["retryable"] is False
 
 
 def test_record_drink_impl_uses_real_user_id(monkeypatch):
@@ -639,19 +764,20 @@ def test_record_drink_impl_requires_authenticated_user():
 
 def test_search_menu_impl_calls_real_search(monkeypatch):
     class _FakeService:
-        async def search(self, query, brand=None, top_k=5):
+        async def search(self, query, brand=None, top_k=5, source="agent"):
             captured["query"] = query
             captured["brand"] = brand
             captured["top_k"] = top_k
+            captured["source"] = source
             return [{"id": "m1", "brand": "喜茶", "name": "多肉葡萄"}]
 
     captured = {}
-    monkeypatch.setattr("app.tooling.operations.QdrantService", lambda: _FakeService())
+    monkeypatch.setattr("app.tooling.operations.get_menu_search_service", lambda: _FakeService())
 
     result = __import__("asyncio").run(_search_menu_impl(query="葡萄", brand="喜茶", user_id="real-user"))
 
     assert result["results"][0]["name"] == "多肉葡萄"
-    assert captured == {"query": "葡萄", "brand": "喜茶", "top_k": 5}
+    assert captured == {"query": "葡萄", "brand": "喜茶", "top_k": 5, "source": "agent"}
 
 
 def test_mcp_guard_requires_user_identity():

@@ -101,3 +101,26 @@ def test_init_collection_raises_on_vector_size_mismatch():
 
     with pytest.raises(RuntimeError, match="vector size mismatch"):
         __import__("asyncio").run(service.init_collection())
+
+
+def test_search_falls_back_to_sparse_when_embedding_unavailable():
+    class _FailingEmbedding:
+        async def embed_text(self, text: str, *, text_type: str = "document"):
+            raise RuntimeError("embedding timeout")
+
+        def vector_size(self) -> int:
+            return 3
+
+    service = QdrantService(
+        client=object(),
+        models=object(),
+        embedding_service=_FailingEmbedding(),
+        sparse_document_provider=lambda **_kwargs: [
+            {"id": "m1", "brand": "喜茶", "name": "多肉葡萄", "description": "葡萄果茶", "price": 19, "item_type": "drink", "drink_category": "fruit_tea"}
+        ],
+    )
+
+    results = __import__("asyncio").run(service.search(query="葡萄", brand="喜茶", top_k=3))
+
+    assert results
+    assert results[0]["name"] == "多肉葡萄"

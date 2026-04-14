@@ -18,6 +18,8 @@ class Menu(SQLModel):
     size: str | None = None
     price: Decimal | None = None
     description: str | None = None
+    item_type: str | None = None
+    drink_category: str | None = None
     is_active: bool = True
 
 
@@ -65,6 +67,8 @@ def _ensure_records_user_schema() -> None:
 
     with _pool.connection() as conn, conn.cursor() as cur:
         cur.execute("ALTER TABLE menu ADD COLUMN IF NOT EXISTS description TEXT")
+        cur.execute("ALTER TABLE menu ADD COLUMN IF NOT EXISTS item_type VARCHAR(24)")
+        cur.execute("ALTER TABLE menu ADD COLUMN IF NOT EXISTS drink_category VARCHAR(32)")
         cur.execute("ALTER TABLE records ADD COLUMN IF NOT EXISTS user_id UUID")
         cur.execute("ALTER TABLE records ADD COLUMN IF NOT EXISTS mood VARCHAR(120)")
         cur.execute(
@@ -101,7 +105,7 @@ def _ensure_memory_schema() -> None:
             CREATE TABLE IF NOT EXISTS agent_threads (
               id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
               user_id UUID NOT NULL REFERENCES user_profile(user_id) ON DELETE CASCADE,
-              thread_key VARCHAR(255) NOT NULL UNIQUE,
+              thread_key VARCHAR(255) NOT NULL,
               title VARCHAR(120),
               status VARCHAR(24) NOT NULL DEFAULT 'active',
               message_count INT NOT NULL DEFAULT 0,
@@ -113,6 +117,10 @@ def _ensure_memory_schema() -> None:
               archived_at TIMESTAMPTZ
             )
             """
+        )
+        cur.execute("ALTER TABLE agent_threads DROP CONSTRAINT IF EXISTS agent_threads_thread_key_key")
+        cur.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_threads_user_thread_key ON agent_threads (user_id, thread_key)"
         )
         cur.execute(
             "CREATE INDEX IF NOT EXISTS idx_agent_threads_user_updated_at ON agent_threads (user_id, updated_at DESC)"

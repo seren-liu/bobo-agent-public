@@ -7,6 +7,8 @@ import os
 import time
 from typing import Any
 
+from app.core.config import get_settings
+from app.core.resilience import call_with_resilience, get_circuit_breaker
 from app.services.llm_budget import estimate_tokens, record_usage
 
 logger = logging.getLogger("bobo.embedding")
@@ -89,10 +91,22 @@ class EmbeddingService:
             return []
 
         start = time.perf_counter()
+        settings = get_settings()
+        primary_dependency = f"embedding.{self._provider_for_model(self._model)}"
         try:
-            out = await self._embed_batch_with_model(texts, model=self._model, text_type=text_type)
+            out = await call_with_resilience(
+                primary_dependency,
+                lambda: self._embed_batch_with_model(texts, model=self._model, text_type=text_type),
+                timeout_seconds=settings.embedding_request_timeout_seconds,
+                breaker=get_circuit_breaker(
+                    primary_dependency,
+                    failure_threshold=settings.dependency_circuit_failure_threshold,
+                    recovery_timeout_seconds=settings.dependency_circuit_recovery_seconds,
+                ),
+            )
             model_used = self._model
             fallback_used = False
+            degraded_reason = ""
         except Exception as exc:
             if not self._fallback_model:
                 raise
@@ -109,9 +123,20 @@ class EmbeddingService:
                     default=str,
                 )
             )
-            out = await self._embed_batch_with_model(texts, model=self._fallback_model, text_type=text_type)
+            fallback_dependency = f"embedding.{self._provider_for_model(self._fallback_model)}"
+            out = await call_with_resilience(
+                fallback_dependency,
+                lambda: self._embed_batch_with_model(texts, model=self._fallback_model, text_type=text_type),
+                timeout_seconds=settings.embedding_request_timeout_seconds,
+                breaker=get_circuit_breaker(
+                    fallback_dependency,
+                    failure_threshold=settings.dependency_circuit_failure_threshold,
+                    recovery_timeout_seconds=settings.dependency_circuit_recovery_seconds,
+                ),
+            )
             model_used = self._fallback_model
             fallback_used = True
+            degraded_reason = str(exc)
 
         logger.info(
             json.dumps(
@@ -120,6 +145,7 @@ class EmbeddingService:
                     "model": model_used,
                     "primary_model": self._model,
                     "fallback_used": fallback_used,
+                    "degraded_reason": degraded_reason,
                     "dimensions": self.vector_size(),
                     "text_type": text_type,
                     "batch_count": len(texts),

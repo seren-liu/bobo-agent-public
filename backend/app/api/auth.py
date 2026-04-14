@@ -1,10 +1,11 @@
 from typing import Literal
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from jose import JWTError
 from pydantic import BaseModel, Field
 
 from app.core.authz import default_user_capabilities, normalize_capabilities
+from app.core.rate_limit import enforce_rate_limit
 from app.core.security import create_access_token, create_refresh_token, decode_token, hash_password, verify_password
 from app.models.db import authenticate_user, create_user
 from app.models.schemas import LoginRequest, RegisterRequest
@@ -35,7 +36,9 @@ def _issue_token_pair(user_id: str, nickname: str = "") -> AuthTokenResponse:
 
 
 @router.post("/login", response_model=AuthTokenResponse)
-def login(payload: LoginRequest) -> AuthTokenResponse:
+def login(payload: LoginRequest, request: Request) -> AuthTokenResponse:
+    client_ip = getattr(getattr(request, "client", None), "host", "unknown")
+    enforce_rate_limit(scope="auth:login:ip", key=client_ip, max_requests=20, window_seconds=60)
     username = payload.username.strip().lower()
     user = authenticate_user(username)
     if not user or not verify_password(payload.password, user["password_hash"]):
@@ -45,7 +48,9 @@ def login(payload: LoginRequest) -> AuthTokenResponse:
 
 
 @router.post("/register", response_model=AuthTokenResponse)
-def register(payload: RegisterRequest) -> AuthTokenResponse:
+def register(payload: RegisterRequest, request: Request) -> AuthTokenResponse:
+    client_ip = getattr(getattr(request, "client", None), "host", "unknown")
+    enforce_rate_limit(scope="auth:register:ip", key=client_ip, max_requests=10, window_seconds=300)
     email = payload.email.strip().lower()
     if "@" not in email:
         raise HTTPException(status_code=422, detail="invalid email")
@@ -63,7 +68,9 @@ def register(payload: RegisterRequest) -> AuthTokenResponse:
 
 
 @router.post("/refresh", response_model=AuthTokenResponse)
-def refresh(payload: RefreshRequest) -> AuthTokenResponse:
+def refresh(payload: RefreshRequest, request: Request) -> AuthTokenResponse:
+    client_ip = getattr(getattr(request, "client", None), "host", "unknown")
+    enforce_rate_limit(scope="auth:refresh:ip", key=client_ip, max_requests=60, window_seconds=60)
     try:
         token_payload = decode_token(payload.refresh_token, expected_token_type="refresh")
     except JWTError as exc:

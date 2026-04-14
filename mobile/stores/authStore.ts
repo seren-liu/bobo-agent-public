@@ -68,6 +68,7 @@ const secureStorage = {
 };
 
 const storage = Platform.OS === 'web' ? AsyncStorage : secureStorage;
+const persistTokens = Platform.OS !== 'web';
 
 export const useAuthStore = create<AuthState>()(
   persist(
@@ -92,8 +93,8 @@ export const useAuthStore = create<AuthState>()(
       name: 'bobo-auth',
       storage: createJSONStorage(() => storage),
       partialize: (state) => ({
-        accessToken: state.accessToken,
-        refreshToken: state.refreshToken,
+        accessToken: persistTokens ? state.accessToken : null,
+        refreshToken: persistTokens ? state.refreshToken : null,
         userId: state.userId,
         nickname: state.nickname,
       }),

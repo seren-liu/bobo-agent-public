@@ -254,6 +254,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.api import vision as vision_api
+from app.core.rate_limit import clear_rate_limits
 from app.models.vision import VisionResult
 
 
@@ -267,6 +268,10 @@ def _build_vision_test_client(user_id: str = "u-test") -> TestClient:
 
     app.include_router(vision_api.router)
     return TestClient(app)
+
+
+def setup_function():
+    clear_rate_limits()
 
 
 def test_upload_url_api_uses_request_user_id(monkeypatch):
@@ -333,6 +338,8 @@ def test_upload_url_api_rejects_non_image(monkeypatch):
 def test_recognize_api_returns_vision_result(monkeypatch):
     client = _build_vision_test_client()
 
+    monkeypatch.setattr(vision_api._cos_service, "validate_user_file_url", lambda image_url, user_id: "photos/u-test/2026-04/test.jpg")
+
     def _fake_recognize(image_url: str, source_type: str, request_id: str | None = None):
         assert image_url == "https://cdn.example.com/order.jpg"
         assert source_type == "photo"
@@ -360,6 +367,8 @@ def test_recognize_api_returns_vision_result(monkeypatch):
 
 def test_recognize_api_returns_manual_entry_fallback(monkeypatch):
     client = _build_vision_test_client()
+
+    monkeypatch.setattr(vision_api._cos_service, "validate_user_file_url", lambda image_url, user_id: "photos/u-test/2026-04/test.jpg")
 
     def _fake_recognize(image_url: str, source_type: str, request_id: str | None = None):
         return VisionResult(
@@ -390,3 +399,42 @@ def test_recognize_api_returns_manual_entry_fallback(monkeypatch):
         "retryable": True,
         "message": "图片识别暂时失败，建议手动补录。",
     }
+
+
+def test_recognize_api_rejects_external_urls(monkeypatch):
+    client = _build_vision_test_client()
+
+    monkeypatch.setattr(vision_api._cos_service, "validate_user_file_url", lambda image_url, user_id: (_ for _ in ()).throw(ValueError("invalid_image_url")))
+
+    resp = client.post(
+        "/bobo/vision/recognize",
+        json={"image_url": "https://example.com/order.jpg", "source_type": "photo"},
+    )
+
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == "invalid_image_url"
+
+
+def test_recognize_api_rate_limit(monkeypatch):
+    client = _build_vision_test_client()
+
+    calls = {"count": 0}
+
+    def _fake_limit(**kwargs):
+        calls["count"] += 1
+        if calls["count"] > 1:
+            raise vision_api.HTTPException(status_code=429, detail="too many requests")
+
+    monkeypatch.setattr(vision_api, "enforce_rate_limit", _fake_limit)
+    monkeypatch.setattr(vision_api._cos_service, "validate_user_file_url", lambda image_url, user_id: "photos/u-test/2026-04/test.jpg")
+    monkeypatch.setattr(
+        vision_api._vision_service,
+        "recognize",
+        lambda image_url, source_type, request_id=None: VisionResult(items=[], source_type="photo", order_time=None),
+    )
+
+    resp1 = client.post("/bobo/vision/recognize", json={"image_url": "https://cdn.example.com/order.jpg", "source_type": "photo"})
+    resp2 = client.post("/bobo/vision/recognize", json={"image_url": "https://cdn.example.com/order.jpg", "source_type": "photo"})
+
+    assert resp1.status_code == 200
+    assert resp2.status_code == 429

@@ -11,6 +11,24 @@ BACKEND_LOG="$ROOT_DIR/.backend.mobile.log"
 BACKEND_PID=""
 STARTED_BACKEND="false"
 
+wait_for_booted_simulator() {
+  local elapsed=0
+  local max_wait=30
+
+  while true; do
+    if xcrun simctl list devices booted 2>/dev/null | grep -q "Booted"; then
+      return 0
+    fi
+
+    sleep 1
+    elapsed=$((elapsed + 1))
+    if [[ $elapsed -ge $max_wait ]]; then
+      echo "[run-mobile] ⚠ iOS Simulator 启动等待超时，继续尝试打开 Expo"
+      return 1
+    fi
+  done
+}
+
 cleanup() {
   if [[ "$STARTED_BACKEND" == "true" && -n "$BACKEND_PID" ]]; then
     echo ""
@@ -275,7 +293,8 @@ echo ""
 
 if [[ "$mode" == "simulator" ]]; then
   open -a Simulator || true
-  npx expo start --ios $clear_flag
+  wait_for_booted_simulator || true
+  npx expo start --host localhost --ios $clear_flag
 else
   echo "[run-mobile] 请确认 iPhone 和 Mac 在同一 Wi-Fi。"
   npx expo start --lan $clear_flag
